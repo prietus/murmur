@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Murmur
+GenericName=IRC Client
+Comment=A native, opinionated IRC client
+Exec=murmur
+Icon=murmur
+Terminal=false
+Categories=Network;Chat;InstantMessaging;IRCClient;
+Keywords=irc;chat;libera;
+StartupWMClass=murmur
