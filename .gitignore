@@ -1,0 +1,4 @@
+/target
+/config.toml
+/.claude
+.DS_Store
