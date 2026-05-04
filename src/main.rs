@@ -37,8 +37,6 @@ const GROUP_SECS: u64 = 300;
 
 const SIDEBAR_W: f32 = 180.0;
 const MEMBERS_W: f32 = 140.0;
-const RAIL_W: f32 = 52.0;
-const RAIL_BTN: f32 = 36.0;
 const CHAT_MAX_W: f32 = 880.0;
 
 const PALETTE_INPUT_ID: &str = "palette-input";
@@ -2045,8 +2043,7 @@ impl App {
         let sw = self.sidebar_anim.interpolate(0.0, SIDEBAR_W, self.now);
         let mw = self.members_anim.interpolate(0.0, MEMBERS_W, self.now);
 
-        let mut panes: Vec<Element<Message>> = Vec::with_capacity(4);
-        panes.push(self.rail());
+        let mut panes: Vec<Element<Message>> = Vec::with_capacity(3);
         if sw > 0.5 {
             panes.push(self.sidebar(sw));
         }
@@ -2172,30 +2169,8 @@ impl App {
             .into()
     }
 
-    fn rail(&self) -> Element<'_, Message> {
-        let buttons: Vec<Element<'_, Message>> = self
-            .networks
-            .iter()
-            .map(|net| self.rail_button(net))
-            .collect();
-
-        let stack_inner = column(buttons)
-            .spacing(tok::S2 as f32)
-            .padding(pad(tok::S3 as f32, 0.0, tok::S3 as f32, 0.0));
-
-        container(scrollable(stack_inner).height(Fill))
-            .width(Length::Fixed(RAIL_W))
-            .height(Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Color(tok::bg_0())),
-                ..Default::default()
-            })
-            .into()
-    }
-
-    fn rail_button(&self, net: &NetworkState) -> Element<'_, Message> {
+    fn network_row(&self, net: &NetworkState) -> Element<'_, Message> {
         let active = self.active == Some(net.id);
-        let hovered = self.hovered_network == Some(net.id);
         let initial = net
             .cfg
             .name
@@ -2209,53 +2184,62 @@ impl App {
         let bg = nick_color(&net.cfg.name);
         let dot = status_color(net.status);
 
-        let initial_text = container(
+        // Same 22px tile size as channel_row's `[#]` tile so they line up.
+        let avatar = container(
             text(initial)
-                .size(sz(15.0))
+                .size(sz(11.0))
                 .font(medium())
                 .color(Color::WHITE),
         )
-        .width(Length::Fixed(RAIL_BTN))
-        .height(Length::Fixed(RAIL_BTN))
-        .center_x(Length::Fixed(RAIL_BTN))
-        .center_y(Length::Fixed(RAIL_BTN))
+        .width(Length::Fixed(22.0))
+        .height(Length::Fixed(22.0))
+        .center_x(Length::Fixed(22.0))
+        .center_y(Length::Fixed(22.0))
         .style(move |_| container::Style {
             background: Some(Background::Color(bg)),
-            border: Border {
-                color: if active { tok::accent() } else { Color::TRANSPARENT },
-                width: if active { 2.0 } else { 0.0 },
-                radius: if hovered || active { 12.0.into() } else { 9.0.into() },
-            },
+            border: Border { radius: 6.0.into(), ..Default::default() },
             ..Default::default()
         });
 
-        let dot_overlay = container(
-            container(sp(8, 8)).style(move |_| container::Style {
+        let label_color = if active { tok::text() } else { tok::text_mid() };
+
+        let row_content = row![
+            avatar,
+            text(truncate(&net.cfg.name, 14))
+                .size(sz(13.0))
+                .font(if active { medium() } else { regular() })
+                .color(label_color)
+                .wrapping(iced::widget::text::Wrapping::None),
+            sp(Fill, 0),
+            container(sp(6, 6)).style(move |_| container::Style {
                 background: Some(Background::Color(dot)),
-                border: Border {
-                    color: tok::bg_0(),
-                    width: 1.5,
-                    radius: 4.0.into(),
-                },
+                border: Border { radius: 3.0.into(), ..Default::default() },
                 ..Default::default()
             }),
-        )
-        .width(Length::Fixed(RAIL_BTN))
-        .height(Length::Fixed(RAIL_BTN))
-        .align_x(iced::alignment::Horizontal::Right)
-        .align_y(iced::alignment::Vertical::Bottom);
+        ]
+        .spacing(tok::S3)
+        .align_y(iced::Alignment::Center);
 
-        let stacked = stack![initial_text, dot_overlay];
-
-        let centered = container(stacked)
-            .width(Length::Fixed(RAIL_W))
-            .height(Length::Fixed(RAIL_BTN + 4.0))
-            .center_x(Length::Fixed(RAIL_W))
-            .center_y(Length::Fixed(RAIL_BTN + 4.0));
+        let row_bg = if active {
+            tok::accent_soft()
+        } else {
+            Color::TRANSPARENT
+        };
 
         let id = net.id;
-        mouse_area(centered)
+        let btn = button(row_content)
             .on_press(Message::NetworkSelected(id))
+            .width(Fill)
+            .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S2 as f32))
+            .style(move |_theme, _status| button::Style {
+                background: Some(Background::Color(row_bg)),
+                text_color: tok::text(),
+                border: Border { radius: 6.0.into(), ..Default::default() },
+                shadow: Shadow::default(),
+                ..Default::default()
+            });
+
+        mouse_area(btn)
             .on_enter(Message::HoverNetwork(Some(id)))
             .on_exit(Message::HoverNetwork(None))
             .interaction(iced::mouse::Interaction::Pointer)
@@ -2263,25 +2247,38 @@ impl App {
     }
 
     fn sidebar(&self, width: f32) -> Element<'_, Message> {
-        let dot_color = status_color(self.current_status());
-        let label = self
-            .active_net()
-            .map(|n| n.cfg.name.clone())
-            .unwrap_or_else(|| "not connected".into());
+        let network_rows: Vec<Element<Message>> = self
+            .networks
+            .iter()
+            .map(|n| self.network_row(n))
+            .collect();
 
-        let server_label = container(
-            row![
-                container(sp(6, 6)).style(move |_| container::Style {
-                    background: Some(Background::Color(dot_color)),
-                    border: Border { radius: 3.0.into(), ..Default::default() },
-                    ..Default::default()
-                }),
-                text(label).size(sz(12.0)).font(medium()).color(tok::text_mid()),
-            ]
-            .spacing(tok::S2)
-            .align_y(iced::Alignment::Center),
-        )
-        .padding(pad(tok::S4, tok::S4, tok::S3, tok::S4));
+        let networks_section: Element<Message> = if network_rows.is_empty() {
+            // No networks defined — show the "not connected" hint.
+            let dot = status_color(self.current_status());
+            container(
+                row![
+                    container(sp(6, 6)).style(move |_| container::Style {
+                        background: Some(Background::Color(dot)),
+                        border: Border { radius: 3.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }),
+                    text("not connected")
+                        .size(sz(12.0))
+                        .font(medium())
+                        .color(tok::text_muted()),
+                ]
+                .spacing(tok::S2)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(pad(tok::S4, tok::S4, tok::S3, tok::S4))
+            .into()
+        } else {
+            column(network_rows)
+                .spacing(0)
+                .padding(pad(tok::S2 as f32, tok::S2 as f32, tok::S2 as f32, tok::S2 as f32))
+                .into()
+        };
 
         let divider = container(sp(Fill, 1))
             .style(|_| container::Style {
@@ -2306,7 +2303,7 @@ impl App {
         .height(Fill);
 
         container(
-            container(column![server_label, divider, list].spacing(0))
+            container(column![networks_section, divider, list].spacing(0))
                 .width(SIDEBAR_W)
                 .height(Fill)
                 .style(|_| container::Style {
