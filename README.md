@@ -1,6 +1,6 @@
 # Murmur
 
-A native, opinionated IRC client. Built in Rust with [iced](https://iced.rs).
+[murmur.priet.us](https://murmur.priet.us) — A native, opinionated IRC client. Built in Rust with [iced](https://iced.rs).
 
 Murmur is a quiet client. Joins, parts, and noise fade into the background; conversation gets the foreground. Subtle by default, with `/dimm` for focus mode, inline media previews, tab-complete, command palette (⌘K), per-channel logs, and SASL PLAIN / EXTERNAL (CertFP).
 
