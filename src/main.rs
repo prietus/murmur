@@ -35,9 +35,10 @@ static FONT_SCALE: OnceLock<f32> = OnceLock::new();
 const FADE_MS: u128 = 250;
 const GROUP_SECS: u64 = 300;
 
-const SIDEBAR_W: f32 = 180.0;
-const MEMBERS_W: f32 = 140.0;
-const CHAT_MAX_W: f32 = 880.0;
+const SIDEBAR_MIN_W: f32 = 130.0;
+const SIDEBAR_MAX_W: f32 = 240.0;
+const MEMBERS_MIN_W: f32 = 110.0;
+const MEMBERS_MAX_W: f32 = 200.0;
 
 const PALETTE_INPUT_ID: &str = "palette-input";
 const COMPOSE_INPUT_ID: &str = "compose-input";
@@ -97,6 +98,7 @@ mod tok {
     pub const S4: f32 = 12.0;
     #[allow(dead_code)]
     pub const S5: f32 = 16.0;
+    #[allow(dead_code)]
     pub const S6: f32 = 18.0;
 
     use iced::Color;
@@ -274,7 +276,7 @@ fn font_scale() -> f32 {
 }
 
 fn sz(base: f32) -> f32 {
-    base * font_scale()
+    (base - 1.0).max(9.0) * font_scale()
 }
 
 fn regular() -> Font {
@@ -2039,17 +2041,53 @@ impl App {
         Subscription::batch(subs)
     }
 
+    fn sidebar_target_width(&self) -> f32 {
+        let mut longest: usize = 6;
+        for n in &self.networks {
+            let chars = truncate(&n.cfg.name, 14).chars().count();
+            longest = longest.max(chars);
+        }
+        let active_id = self.active;
+        for ch in &self.channels {
+            if Some(ch.network_id) == active_id {
+                let (_, label) = channel_parts(&ch.name);
+                let chars = truncate(&label, 18).chars().count();
+                longest = longest.max(chars);
+            }
+        }
+        // Tile (22) + spacing + label width + dot reservation + paddings.
+        let char_w = sz(13.0) * 0.62;
+        let w = 22.0 + 10.0 + (longest as f32 * char_w) + 14.0 + 16.0 + 12.0;
+        w.clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W)
+    }
+
+    fn members_target_width(&self) -> f32 {
+        let mut longest: usize = 6;
+        if let Some(ch) = self.channels.get(self.selected) {
+            for nick in &ch.members {
+                let chars = truncate(nick, 14).chars().count();
+                longest = longest.max(chars);
+            }
+        }
+        let char_w = sz(12.0) * 0.62;
+        // dot (6) + spacing (S2=6) + label + paddings
+        let w = 6.0 + 6.0 + (longest as f32 * char_w) + 24.0;
+        w.clamp(MEMBERS_MIN_W, MEMBERS_MAX_W)
+    }
+
     fn view(&self) -> Element<'_, Message> {
-        let sw = self.sidebar_anim.interpolate(0.0, SIDEBAR_W, self.now);
-        let mw = self.members_anim.interpolate(0.0, MEMBERS_W, self.now);
+        let sidebar_target = self.sidebar_target_width();
+        let members_target = self.members_target_width();
+        let sw = self.sidebar_anim.interpolate(0.0, sidebar_target, self.now);
+        let mw = self.members_anim.interpolate(0.0, members_target, self.now);
 
         let mut panes: Vec<Element<Message>> = Vec::with_capacity(3);
         if sw > 0.5 {
-            panes.push(self.sidebar(sw));
+            panes.push(self.sidebar(sw, sidebar_target));
         }
         panes.push(self.chat_pane());
         if mw > 0.5 {
-            panes.push(self.member_pane(mw));
+            panes.push(self.member_pane(mw, members_target));
         }
 
         let main: Element<Message> = row(panes).spacing(0).height(Fill).into();
@@ -2246,7 +2284,7 @@ impl App {
             .into()
     }
 
-    fn sidebar(&self, width: f32) -> Element<'_, Message> {
+    fn sidebar(&self, width: f32, target: f32) -> Element<'_, Message> {
         let network_rows: Vec<Element<Message>> = self
             .networks
             .iter()
@@ -2304,7 +2342,7 @@ impl App {
 
         container(
             container(column![networks_section, divider, list].spacing(0))
-                .width(SIDEBAR_W)
+                .width(Length::Fixed(target))
                 .height(Fill)
                 .style(|_| container::Style {
                     background: Some(Background::Color(tok::bg_0())),
@@ -2392,15 +2430,45 @@ impl App {
         let ch = &self.channels[self.selected];
 
         let (prefix, label) = channel_parts(&ch.name);
+
+        let net_name = self
+            .net(ch.network_id)
+            .map(|n| n.cfg.name.clone())
+            .unwrap_or_default();
+        let members_count = ch.members.len();
+
+        let mut meta_parts: Vec<String> = Vec::new();
+        if !net_name.is_empty() {
+            meta_parts.push(format!("@ {}", net_name));
+        }
+        if members_count > 0 {
+            meta_parts.push(format!(
+                "{} {}",
+                members_count,
+                if members_count == 1 { "user" } else { "users" }
+            ));
+        }
+        let meta_el: Element<Message> = if meta_parts.is_empty() {
+            sp(0, 0).into()
+        } else {
+            text(meta_parts.join(" — "))
+                .size(sz(12.0))
+                .color(tok::text_muted())
+                .font(regular())
+                .into()
+        };
+
         let header_title: Element<Message> = row![
-            channel_tile(prefix, tile_style_for(0.0, 1.0), 26.0, sz(13.0)),
-            text(label).size(sz(15.0)).font(medium()).color(tok::text()),
+            channel_tile(prefix, tile_style_for(0.0, 1.0), 20.0, sz(11.0)),
+            text(label).size(sz(13.0)).font(medium()).color(tok::text()),
+            sp(tok::S3, 0),
+            meta_el,
         ]
-        .spacing(tok::S3)
+        .spacing(tok::S2)
         .align_y(iced::Alignment::Center)
         .into();
         let header_topic: Element<Message> = match &ch.topic {
-            Some(t) => text(t.clone()).size(sz(12.0)).color(tok::text_muted()).into(),
+            Some(t) => text(t.clone()).size(sz(11.0)).color(tok::text_muted()).into(),
             None => sp(0, 0).into(),
         };
 
@@ -2426,7 +2494,7 @@ impl App {
             .spacing(tok::S3)
             .align_y(iced::Alignment::Center),
         )
-        .padding(pad(tok::S4, tok::S4, tok::S4, tok::S4))
+        .padding(pad(tok::S2, tok::S3, tok::S2, tok::S3))
         .width(Fill)
         .style(|_| container::Style {
             background: Some(Background::Color(tok::bg_1())),
@@ -2441,14 +2509,10 @@ impl App {
         let msgs = self.render_messages(ch);
 
         let msg_area = scrollable(
-            container(
-                column(msgs)
-                    .spacing(0)
-                    .padding(pad(tok::S4, tok::S6, tok::S4, tok::S6))
-                    .width(Fill),
-            )
-            .max_width(CHAT_MAX_W)
-            .center_x(Fill),
+            column(msgs)
+                .spacing(0)
+                .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
+                .width(Fill),
         )
         .height(Fill)
         .width(Fill);
@@ -2488,15 +2552,11 @@ impl App {
         };
 
         let input = container(
-            container(
-                row![text_field, send_btn]
-                    .spacing(tok::S2)
-                    .align_y(iced::Alignment::Center),
-            )
-            .max_width(CHAT_MAX_W)
-            .center_x(Fill),
+            row![text_field, send_btn]
+                .spacing(tok::S2)
+                .align_y(iced::Alignment::Center),
         )
-        .padding(pad(tok::S2, tok::S6, tok::S4, tok::S6));
+        .padding(pad(tok::S2, tok::S4, tok::S3, tok::S4));
 
         container(column![header, msg_area, input])
             .width(Fill)
@@ -2708,26 +2768,8 @@ impl App {
             .into()
     }
 
-    fn member_pane(&self, width: f32) -> Element<'_, Message> {
+    fn member_pane(&self, width: f32, target: f32) -> Element<'_, Message> {
         let ch = &self.channels[self.selected];
-
-        let header = container(
-            row![
-                text("members").size(sz(11.0)).color(tok::text_muted()).font(medium()),
-                sp(Fill, 0),
-                text(format!("{}", ch.members.len()))
-                    .size(sz(11.0))
-                    .color(tok::text_faint())
-                    .font(medium()),
-            ]
-            .align_y(iced::Alignment::Center),
-        )
-        .padding(pad(tok::S4 as f32, tok::S4 as f32, tok::S3 as f32, tok::S4 as f32));
-
-        let divider = container(sp(Fill, 1)).style(|_| container::Style {
-            background: Some(Background::Color(tok::border_soft())),
-            ..Default::default()
-        });
 
         let items: Vec<Element<Message>> = ch
             .members
@@ -2736,11 +2778,16 @@ impl App {
             .map(|(i, m)| self.member_row(i, m))
             .collect();
 
-        let list = scrollable(column(items).spacing(0)).height(Fill);
+        let list = scrollable(
+            column(items)
+                .spacing(0)
+                .padding(pad(tok::S2 as f32, 0.0, tok::S2 as f32, 0.0)),
+        )
+        .height(Fill);
 
         container(
-            container(column![header, divider, list].spacing(0))
-                .width(MEMBERS_W)
+            container(list)
+                .width(Length::Fixed(target))
                 .height(Fill)
                 .style(|_| container::Style {
                     background: Some(Background::Color(tok::bg_0())),
