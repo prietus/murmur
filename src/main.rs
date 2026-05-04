@@ -22,7 +22,7 @@ use iced::{
     Task, Theme,
 };
 
-use crate::config::{AppConfig, LoadResult};
+use crate::config::{AppConfig, LoadResult, NetworkConfig};
 use crate::irc_worker::{Event as IrcEvent, Outgoing};
 
 const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -37,6 +37,8 @@ const GROUP_SECS: u64 = 300;
 
 const SIDEBAR_W: f32 = 180.0;
 const MEMBERS_W: f32 = 140.0;
+const RAIL_W: f32 = 52.0;
+const RAIL_BTN: f32 = 36.0;
 const CHAT_MAX_W: f32 = 880.0;
 
 const PALETTE_INPUT_ID: &str = "palette-input";
@@ -58,6 +60,9 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/ping", "ping a user: /ping <nick>", true),
     ("/hidejoins", "toggle hiding join/part lines in the current channel", false),
     ("/logs", "show the chat log directory path", false),
+    ("/server", "switch active network: /server <name>", true),
+    ("/connect", "enable autoconnect for a network: /connect <name>", true),
+    ("/disconnect", "disconnect from a network (current if no name)", false),
 ];
 
 fn main() -> iced::Result {
@@ -377,7 +382,7 @@ enum Message {
     ToggleSidebar,
     ToggleMembers,
     Tick(Instant),
-    Irc(IrcEvent),
+    Irc(NetworkId, IrcEvent),
     Key(keyboard::Event),
     PaletteQuery(String),
     PaletteActivate,
@@ -388,6 +393,8 @@ enum Message {
     StartDmWith(String),
     MediaFetched(FetchedMedia),
     CloseChannel(usize),
+    NetworkSelected(NetworkId),
+    HoverNetwork(Option<NetworkId>),
 }
 
 #[derive(Clone)]
@@ -428,25 +435,39 @@ enum ConnStatus {
     Error,
 }
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+struct NetworkId(u32);
+
+struct NetworkState {
+    id: NetworkId,
+    cfg: NetworkConfig,
+    status: ConnStatus,
+    outgoing: Option<mpsc::Sender<Outgoing>>,
+    last_error: Option<String>,
+    autoconnect_enabled: bool,
+    last_selected: Option<usize>,
+}
+
 struct App {
+    networks: Vec<NetworkState>,
+    active: Option<NetworkId>,
     channels: Vec<Channel>,
     selected: usize,
     input: String,
     now: Instant,
     sidebar_anim: Animation<bool>,
     members_anim: Animation<bool>,
-    cfg: Option<AppConfig>,
     #[allow(dead_code)]
     cfg_path: Option<PathBuf>,
-    status: ConnStatus,
+    fallback_status: ConnStatus,
     last_error: Option<String>,
-    outgoing: Option<mpsc::Sender<Outgoing>>,
     dimmed_nicks: HashSet<String>,
     palette_open: bool,
     palette_query: String,
     palette_cursor: usize,
     hovered_channel: Option<usize>,
     hovered_member: Option<usize>,
+    hovered_network: Option<NetworkId>,
     tab_state: Option<TabState>,
     media_cache: HashMap<String, MediaState>,
     theme_name: String,
@@ -464,6 +485,7 @@ struct TabState {
 }
 
 struct Channel {
+    network_id: NetworkId,
     name: String,
     topic: Option<String>,
     messages: Vec<ChatMessage>,
@@ -503,23 +525,24 @@ impl Default for App {
     fn default() -> Self {
         let now = Instant::now();
         let base = App {
+            networks: Vec::new(),
+            active: None,
             channels: Vec::new(),
             selected: 0,
             input: String::new(),
             now,
             sidebar_anim: Animation::new(true).quick().easing(Easing::EaseOutQuint),
             members_anim: Animation::new(true).quick().easing(Easing::EaseOutQuint),
-            cfg: None,
             cfg_path: config::config_path(),
-            status: ConnStatus::NotConfigured,
+            fallback_status: ConnStatus::NotConfigured,
             last_error: None,
-            outgoing: None,
             dimmed_nicks: HashSet::new(),
             palette_open: false,
             palette_query: String::new(),
             palette_cursor: 0,
             hovered_channel: None,
             hovered_member: None,
+            hovered_network: None,
             tab_state: None,
             media_cache: HashMap::new(),
             theme_name: "soft-dark".into(),
@@ -530,28 +553,18 @@ impl Default for App {
 
         match config::load() {
             LoadResult::Loaded(cfg) => {
-                let theme_name = cfg
-                    .theme
-                    .clone()
-                    .filter(|n| themes::by_name(n).is_some())
-                    .unwrap_or_else(|| "soft-dark".into());
-                theme::set(themes::by_name(&theme_name).unwrap_or(themes::SOFT_DARK));
-                App {
-                    channels: vec![status_channel(
-                        "",
-                        vec![system_line(
-                            &format!("connecting to {}:{}...", cfg.server, cfg.port),
-                            now,
-                        )],
-                    )],
-                    status: ConnStatus::Connecting,
-                    cfg: Some(cfg),
-                    theme_name,
-                    ..base
-                }
+                build_app_from_cfg(base, cfg, None, now)
+            }
+            LoadResult::Migrated { cfg, backup } => {
+                let note = format!(
+                    "config migrated to multi-network format; backup at {}",
+                    backup.display()
+                );
+                build_app_from_cfg(base, cfg, Some(note), now)
             }
             LoadResult::WroteTemplate(path) => App {
                 channels: vec![status_channel(
+                    NetworkId(0),
                     "",
                     vec![
                         system_line("no config found", now),
@@ -559,19 +572,20 @@ impl Default for App {
                         system_line("edit it with your server + nick, then restart.", now),
                     ],
                 )],
-                status: ConnStatus::TemplateWritten,
+                fallback_status: ConnStatus::TemplateWritten,
                 cfg_path: Some(path),
                 ..base
             },
             LoadResult::Error(e) => App {
                 channels: vec![status_channel(
+                    NetworkId(0),
                     "",
                     vec![
                         system_line("config error:", now),
                         system_line(&e, now),
                     ],
                 )],
-                status: ConnStatus::Error,
+                fallback_status: ConnStatus::Error,
                 last_error: Some(e),
                 ..base
             },
@@ -579,8 +593,83 @@ impl Default for App {
     }
 }
 
-fn status_channel(topic: &str, messages: Vec<ChatMessage>) -> Channel {
+fn build_app_from_cfg(
+    base: App,
+    cfg: AppConfig,
+    migration_note: Option<String>,
+    now: Instant,
+) -> App {
+    let theme_name = cfg
+        .theme
+        .clone()
+        .filter(|n| themes::by_name(n).is_some())
+        .unwrap_or_else(|| "soft-dark".into());
+    theme::set(themes::by_name(&theme_name).unwrap_or(themes::SOFT_DARK));
+
+    if cfg.networks.is_empty() {
+        return App {
+            channels: vec![status_channel(
+                NetworkId(0),
+                "",
+                vec![
+                    system_line("no networks defined in config", now),
+                    system_line("add a [[network]] block and restart.", now),
+                ],
+            )],
+            fallback_status: ConnStatus::NotConfigured,
+            theme_name,
+            ..base
+        };
+    }
+
+    let mut networks: Vec<NetworkState> = Vec::with_capacity(cfg.networks.len());
+    let mut channels: Vec<Channel> = Vec::new();
+    for (i, ncfg) in cfg.networks.iter().enumerate() {
+        let id = NetworkId(i as u32);
+        let intro = if ncfg.autoconnect {
+            format!("connecting to {}:{}...", ncfg.server, ncfg.port)
+        } else {
+            format!("autoconnect disabled — /connect {} to dial", ncfg.name)
+        };
+        let mut intro_msgs = vec![system_line(&intro, now)];
+        if let Some(note) = migration_note.as_ref() {
+            if i == 0 {
+                intro_msgs.insert(0, system_line(note, now));
+            }
+        }
+        channels.push(status_channel(id, "", intro_msgs));
+        let last_selected = Some(channels.len() - 1);
+        networks.push(NetworkState {
+            id,
+            cfg: ncfg.clone(),
+            status: if ncfg.autoconnect { ConnStatus::Connecting } else { ConnStatus::NotConfigured },
+            outgoing: None,
+            last_error: None,
+            autoconnect_enabled: ncfg.autoconnect,
+            last_selected,
+        });
+    }
+
+    let active = networks.first().map(|n| n.id);
+    let selected = networks
+        .first()
+        .and_then(|n| n.last_selected)
+        .unwrap_or(0);
+
+    let _ = cfg; // global UI prefs already applied; per-network cfgs live in `networks`
+    App {
+        networks,
+        active,
+        channels,
+        selected,
+        theme_name,
+        ..base
+    }
+}
+
+fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>) -> Channel {
     Channel {
+        network_id,
         name: "&status".into(),
         topic: if topic.is_empty() { None } else { Some(topic.into()) },
         members: Vec::new(),
@@ -617,8 +706,12 @@ fn joinpart_line(body: &str, now: Instant) -> ChatMessage {
     }
 }
 
-fn irc_sub(cfg: &AppConfig) -> Pin<Box<dyn Stream<Item = IrcEvent> + Send>> {
-    Box::pin(irc_worker::subscribe(cfg))
+fn irc_sub_for_network(
+    keyed: &(NetworkId, NetworkConfig),
+) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
+    use futures::StreamExt;
+    let id = keyed.0;
+    Box::pin(irc_worker::subscribe(&keyed.1).map(move |ev| Message::Irc(id, ev)))
 }
 
 mod chatlog {
@@ -707,6 +800,66 @@ fn now_hhmm() -> String {
 }
 
 impl App {
+    fn idx_of_net(&self, id: NetworkId) -> Option<usize> {
+        self.networks.iter().position(|n| n.id == id)
+    }
+
+    fn net(&self, id: NetworkId) -> Option<&NetworkState> {
+        self.idx_of_net(id).map(|i| &self.networks[i])
+    }
+
+    fn net_mut(&mut self, id: NetworkId) -> Option<&mut NetworkState> {
+        self.idx_of_net(id).map(move |i| &mut self.networks[i])
+    }
+
+    fn active_net(&self) -> Option<&NetworkState> {
+        self.active.and_then(|id| self.net(id))
+    }
+
+    fn active_net_mut(&mut self) -> Option<&mut NetworkState> {
+        let id = self.active?;
+        self.net_mut(id)
+    }
+
+    fn current_status(&self) -> ConnStatus {
+        self.active_net().map(|n| n.status).unwrap_or(self.fallback_status)
+    }
+
+    fn current_nickname(&self) -> Option<String> {
+        self.active_net().map(|n| n.cfg.nickname.clone())
+    }
+
+    fn current_network_name_for_log(&self) -> String {
+        self.active_net()
+            .map(|n| n.cfg.name.clone())
+            .unwrap_or_else(|| "unknown".into())
+    }
+
+    // Returns the channel index for `name` within the given network,
+    // creating an empty channel if none exists.
+    fn ensure_channel_in(&mut self, network_id: NetworkId, name: &str) -> usize {
+        if let Some(i) = self
+            .channels
+            .iter()
+            .position(|c| c.network_id == network_id && c.name == name)
+        {
+            return i;
+        }
+        self.channels.push(Channel {
+            network_id,
+            name: name.to_string(),
+            topic: None,
+            messages: Vec::new(),
+            members: Vec::new(),
+            dimm: false,
+            hide_joinpart: false,
+            hover_anim: new_row_anim(),
+            select_anim: new_row_anim(),
+            fade_baseline: Instant::now(),
+        });
+        self.channels.len() - 1
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         let is_tick = matches!(&message, Message::Tick(_));
         let task = self.dispatch(message);
@@ -759,21 +912,17 @@ impl App {
                 let is_status = target.starts_with('&');
 
                 if !is_status {
-                    if let Some(tx) = self.outgoing.as_mut() {
+                    if let Some(tx) = self.active_net_mut().and_then(|n| n.outgoing.as_mut()) {
                         let _ = tx.try_send(Outgoing::Privmsg {
                             target: target.clone(),
                             text: text.clone(),
                         });
                     }
-                    let nick = self
-                        .cfg
-                        .as_ref()
-                        .map(|c| c.nickname.clone())
-                        .unwrap_or_else(|| "you".into());
+                    let nick = self.current_nickname().unwrap_or_else(|| "you".into());
                     let now = Instant::now();
                     let fetch = self.schedule_media_fetches(&text);
                     chatlog::append(
-                        &self.server_for_log(),
+                        &self.current_network_name_for_log(),
                         &target,
                         &format!("{}  <{}> {}", chatlog::iso_now(), nick, text),
                     );
@@ -805,7 +954,15 @@ impl App {
                 self.now = now;
                 Task::none()
             }
-            Message::Irc(event) => self.handle_irc(event),
+            Message::Irc(net_id, event) => self.handle_irc(net_id, event),
+            Message::NetworkSelected(id) => {
+                self.set_active_network(id);
+                Task::none()
+            }
+            Message::HoverNetwork(v) => {
+                self.hovered_network = v;
+                Task::none()
+            }
             Message::MediaFetched(fetched) => {
                 self.media_cache.insert(fetched.url, fetched.state);
                 Task::none()
@@ -847,7 +1004,8 @@ impl App {
                     return Task::none();
                 }
                 if name.starts_with('#') {
-                    if let Some(tx) = self.outgoing.as_mut() {
+                    let cid = self.channels[i].network_id;
+                    if let Some(tx) = self.net_mut(cid).and_then(|n| n.outgoing.as_mut()) {
                         let _ = tx.try_send(Outgoing::Part {
                             channel: name,
                             reason: None,
@@ -988,10 +1146,7 @@ impl App {
     }
 
     fn server_for_log(&self) -> String {
-        self.cfg
-            .as_ref()
-            .map(|c| c.server.clone())
-            .unwrap_or_else(|| "unknown".into())
+        self.current_network_name_for_log()
     }
 
     fn push_history(&mut self, text: &str) {
@@ -1157,6 +1312,9 @@ impl App {
             "ping" => self.cmd_ping(rest, now),
             "hidejoins" | "joins" | "joinpart" => self.cmd_hide_joins(now),
             "logs" => self.cmd_logs(now),
+            "server" => self.cmd_server(rest, now),
+            "connect" => self.cmd_connect(rest, now),
+            "disconnect" => self.cmd_disconnect(rest, now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -1263,11 +1421,7 @@ impl App {
         ) {
             return;
         }
-        let nick = self
-            .cfg
-            .as_ref()
-            .map(|c| c.nickname.clone())
-            .unwrap_or_else(|| "you".into());
+        let nick = self.current_nickname().unwrap_or_else(|| "you".into());
         self.channels[self.selected].messages.push(ChatMessage {
             nick,
             body: text,
@@ -1299,11 +1453,7 @@ impl App {
             return;
         }
         let idx = self.ensure_channel(&target);
-        let nick = self
-            .cfg
-            .as_ref()
-            .map(|c| c.nickname.clone())
-            .unwrap_or_else(|| "you".into());
+        let nick = self.current_nickname().unwrap_or_else(|| "you".into());
         self.channels[idx].messages.push(ChatMessage {
             nick,
             body,
@@ -1340,6 +1490,106 @@ impl App {
         self.channels[self.selected]
             .messages
             .push(system_line(&msg, now));
+    }
+
+    fn cmd_server(&mut self, rest: &str, now: Instant) {
+        let arg = rest.split_whitespace().next().unwrap_or("");
+        if arg.is_empty() {
+            let names: Vec<String> = self
+                .networks
+                .iter()
+                .map(|n| {
+                    let mark = if Some(n.id) == self.active { "* " } else { "  " };
+                    format!("{mark}{}", n.cfg.name)
+                })
+                .collect();
+            let body = if names.is_empty() {
+                "no networks defined".into()
+            } else {
+                format!("networks:\n{}", names.join("\n"))
+            };
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&body, now));
+            return;
+        }
+        let target_id = self
+            .networks
+            .iter()
+            .find(|n| n.cfg.name.eq_ignore_ascii_case(arg))
+            .map(|n| n.id);
+        match target_id {
+            Some(id) => self.set_active_network(id),
+            None => {
+                self.channels[self.selected]
+                    .messages
+                    .push(system_line(&format!("no network named '{arg}'"), now));
+            }
+        }
+    }
+
+    fn cmd_connect(&mut self, rest: &str, now: Instant) {
+        let arg = rest.split_whitespace().next().unwrap_or("");
+        if arg.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /connect <name>", now));
+            return;
+        }
+        let net_id = self
+            .networks
+            .iter()
+            .find(|n| n.cfg.name.eq_ignore_ascii_case(arg))
+            .map(|n| n.id);
+        let Some(id) = net_id else {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("no network named '{arg}'"), now));
+            return;
+        };
+        if let Some(net) = self.net_mut(id) {
+            if net.autoconnect_enabled {
+                let name = net.cfg.name.clone();
+                self.push_status_in(id, system_line(&format!("{name} already enabled"), now));
+                return;
+            }
+            net.autoconnect_enabled = true;
+            net.status = ConnStatus::Connecting;
+            let name = net.cfg.name.clone();
+            self.push_status_in(id, system_line(&format!("connecting to {name}..."), now));
+        }
+    }
+
+    fn cmd_disconnect(&mut self, rest: &str, now: Instant) {
+        let arg = rest.split_whitespace().next().unwrap_or("");
+        let target_id = if arg.is_empty() {
+            self.active
+        } else {
+            self.networks
+                .iter()
+                .find(|n| n.cfg.name.eq_ignore_ascii_case(arg))
+                .map(|n| n.id)
+        };
+        let Some(id) = target_id else {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(
+                    if arg.is_empty() {
+                        "no active network to disconnect"
+                    } else {
+                        "no such network"
+                    },
+                    now,
+                ));
+            return;
+        };
+        if let Some(net) = self.net_mut(id) {
+            net.autoconnect_enabled = false;
+            net.outgoing = None;
+            net.status = ConnStatus::Disconnected;
+            let name = net.cfg.name.clone();
+            self.push_status_in(id, system_line(&format!("disconnected from {name}"), now));
+        }
     }
 
     fn cmd_hide_joins(&mut self, now: Instant) {
@@ -1469,54 +1719,101 @@ impl App {
     }
 
     fn send_out(&mut self, msg: Outgoing, now: Instant) -> bool {
-        match self.outgoing.as_mut() {
+        let result = match self.active_net_mut().and_then(|n| n.outgoing.as_mut()) {
             Some(tx) => match tx.try_send(msg) {
-                Ok(()) => true,
-                Err(_) => {
-                    self.channels[self.selected]
-                        .messages
-                        .push(system_line("send failed — channel full or closed", now));
-                    false
-                }
+                Ok(()) => Ok(()),
+                Err(_) => Err("send failed — channel full or closed"),
             },
-            None => {
+            None => Err("not connected"),
+        };
+        match result {
+            Ok(()) => true,
+            Err(reason) => {
                 self.channels[self.selected]
                     .messages
-                    .push(system_line("not connected", now));
+                    .push(system_line(reason, now));
                 false
             }
         }
     }
 
-    fn handle_irc(&mut self, event: IrcEvent) -> Task<Message> {
+    fn set_active_network(&mut self, id: NetworkId) {
+        if self.idx_of_net(id).is_none() {
+            return;
+        }
+        // Remember current selection on the old active so we can restore it.
+        if let Some(old_id) = self.active {
+            let cur_sel = self.selected;
+            if let Some(net) = self.net_mut(old_id) {
+                net.last_selected = Some(cur_sel);
+            }
+        }
+        self.active = Some(id);
+        // Restore last selection in this network, or fall back to any
+        // channel of this network (prefer &status).
+        let restore = self
+            .net(id)
+            .and_then(|n| n.last_selected)
+            .filter(|&i| {
+                self.channels.get(i).is_some_and(|c| c.network_id == id)
+            });
+        let target = restore.or_else(|| {
+            self.channels
+                .iter()
+                .position(|c| c.network_id == id && c.name == "&status")
+        }).or_else(|| {
+            self.channels.iter().position(|c| c.network_id == id)
+        });
+        if let Some(i) = target {
+            self.set_selected(i);
+        }
+    }
+
+    fn handle_irc(&mut self, network_id: NetworkId, event: IrcEvent) -> Task<Message> {
         let now = Instant::now();
         self.now = now;
+        // Network must exist for the event to be meaningful — else drop it.
+        if self.idx_of_net(network_id).is_none() {
+            return Task::none();
+        }
+        let net_name = self
+            .net(network_id)
+            .map(|n| n.cfg.name.clone())
+            .unwrap_or_default();
         match event {
             IrcEvent::Ready(tx) => {
-                self.outgoing = Some(tx);
+                if let Some(net) = self.net_mut(network_id) {
+                    net.outgoing = Some(tx);
+                }
                 Task::none()
             }
             IrcEvent::Connected => {
-                self.status = ConnStatus::Connected;
-                self.push_status(system_line("connected", now));
+                if let Some(net) = self.net_mut(network_id) {
+                    net.status = ConnStatus::Connected;
+                }
+                self.push_status_in(network_id, system_line("connected", now));
                 Task::none()
             }
             IrcEvent::ConnectError(e) => {
-                self.status = ConnStatus::Error;
-                self.push_status(system_line(&format!("error: {e}"), now));
+                if let Some(net) = self.net_mut(network_id) {
+                    net.status = ConnStatus::Error;
+                    net.last_error = Some(e.clone());
+                }
+                self.push_status_in(network_id, system_line(&format!("error: {e}"), now));
                 self.last_error = Some(e);
                 Task::none()
             }
             IrcEvent::Disconnected => {
-                self.status = ConnStatus::Disconnected;
-                self.push_status(system_line("disconnected", now));
+                if let Some(net) = self.net_mut(network_id) {
+                    net.status = ConnStatus::Disconnected;
+                }
+                self.push_status_in(network_id, system_line("disconnected", now));
                 Task::none()
             }
             IrcEvent::Privmsg { target, nick, body } => {
                 let my_nick = self
-                    .cfg
-                    .as_ref()
-                    .map(|c| c.nickname.clone())
+                    .net(network_id)
+                    .map(|n| n.cfg.nickname.clone())
                     .unwrap_or_default();
                 let is_self = nick == my_nick;
                 let is_dm = !my_nick.is_empty() && target == my_nick;
@@ -1528,10 +1825,10 @@ impl App {
                     }
                 }
                 let bucket = if is_dm { nick.clone() } else { target };
-                let idx = self.ensure_channel(&bucket);
+                let idx = self.ensure_channel_in(network_id, &bucket);
                 let fetch = self.schedule_media_fetches(&body);
                 chatlog::append(
-                    &self.server_for_log(),
+                    &net_name,
                     &bucket,
                     &format!("{}  <{}> {}", chatlog::iso_now(), nick, body),
                 );
@@ -1548,9 +1845,8 @@ impl App {
             }
             IrcEvent::Action { target, nick, body } => {
                 let my_nick = self
-                    .cfg
-                    .as_ref()
-                    .map(|c| c.nickname.clone())
+                    .net(network_id)
+                    .map(|n| n.cfg.nickname.clone())
                     .unwrap_or_default();
                 let is_self = nick == my_nick;
                 let is_dm = !my_nick.is_empty() && target == my_nick;
@@ -1562,10 +1858,10 @@ impl App {
                     }
                 }
                 let bucket = if is_dm { nick.clone() } else { target };
-                let idx = self.ensure_channel(&bucket);
+                let idx = self.ensure_channel_in(network_id, &bucket);
                 let fetch = self.schedule_media_fetches(&body);
                 chatlog::append(
-                    &self.server_for_log(),
+                    &net_name,
                     &bucket,
                     &format!("{}  * {} {}", chatlog::iso_now(), nick, body),
                 );
@@ -1582,15 +1878,17 @@ impl App {
             }
             IrcEvent::NickChanged { old, new } => {
                 let is_self = self
-                    .cfg
-                    .as_ref()
-                    .is_some_and(|c| c.nickname == old);
+                    .net(network_id)
+                    .is_some_and(|n| n.cfg.nickname == old);
                 if is_self {
-                    if let Some(cfg) = self.cfg.as_mut() {
-                        cfg.nickname = new.clone();
+                    if let Some(net) = self.net_mut(network_id) {
+                        net.cfg.nickname = new.clone();
                     }
                 }
                 for ch in self.channels.iter_mut() {
+                    if ch.network_id != network_id {
+                        continue;
+                    }
                     if let Some(pos) = ch.members.iter().position(|n| n == &old) {
                         ch.members[pos] = new.clone();
                         let body = if is_self {
@@ -1602,17 +1900,17 @@ impl App {
                     }
                 }
                 if is_self {
-                    self.push_status(system_line(&format!("you are now {new}"), now));
+                    self.push_status_in(network_id, system_line(&format!("you are now {new}"), now));
                 }
                 Task::none()
             }
             IrcEvent::UserJoined { channel, nick } => {
-                let idx = self.ensure_channel(&channel);
+                let idx = self.ensure_channel_in(network_id, &channel);
                 if !self.channels[idx].members.iter().any(|n| n == &nick) {
                     self.channels[idx].members.push(nick.clone());
                 }
                 chatlog::append(
-                    &self.server_for_log(),
+                    &net_name,
                     &channel,
                     &format!("{}  -- {} joined", chatlog::iso_now(), nick),
                 );
@@ -1622,10 +1920,10 @@ impl App {
                 Task::none()
             }
             IrcEvent::UserLeft { channel, nick } => {
-                let idx = self.ensure_channel(&channel);
+                let idx = self.ensure_channel_in(network_id, &channel);
                 self.channels[idx].members.retain(|n| n != &nick);
                 chatlog::append(
-                    &self.server_for_log(),
+                    &net_name,
                     &channel,
                     &format!("{}  -- {} left", chatlog::iso_now(), nick),
                 );
@@ -1635,7 +1933,7 @@ impl App {
                 Task::none()
             }
             IrcEvent::Names { channel, nicks } => {
-                let idx = self.ensure_channel(&channel);
+                let idx = self.ensure_channel_in(network_id, &channel);
                 for n in nicks {
                     if !self.channels[idx].members.iter().any(|m| m == &n) {
                         self.channels[idx].members.push(n);
@@ -1644,9 +1942,9 @@ impl App {
                 Task::none()
             }
             IrcEvent::Topic { channel, topic } => {
-                let idx = self.ensure_channel(&channel);
+                let idx = self.ensure_channel_in(network_id, &channel);
                 chatlog::append(
-                    &self.server_for_log(),
+                    &net_name,
                     &channel,
                     &format!("{}  -- topic: {}", chatlog::iso_now(), topic),
                 );
@@ -1654,7 +1952,7 @@ impl App {
                 Task::none()
             }
             IrcEvent::Notice { from, text } => {
-                self.push_status(system_line(&format!("-{from}- {text}"), now));
+                self.push_status_in(network_id, system_line(&format!("-{from}- {text}"), now));
                 Task::none()
             }
             IrcEvent::CtcpReply { from, query, args } => {
@@ -1674,29 +1972,18 @@ impl App {
                 } else {
                     format!("← CTCP {query} reply from {from}: {args}")
                 };
-                let idx = self.ensure_channel(&from);
+                let idx = self.ensure_channel_in(network_id, &from);
                 self.channels[idx].messages.push(system_line(&body, now));
                 Task::none()
             }
         }
     }
 
+    // Resolve a channel name in the *active* network, creating it if needed.
+    // Used by all command paths (commands act on the active network).
     fn ensure_channel(&mut self, name: &str) -> usize {
-        if let Some(i) = self.channels.iter().position(|c| c.name == name) {
-            return i;
-        }
-        self.channels.push(Channel {
-            name: name.to_string(),
-            topic: None,
-            messages: Vec::new(),
-            members: Vec::new(),
-            dimm: false,
-            hide_joinpart: false,
-            hover_anim: new_row_anim(),
-            select_anim: new_row_anim(),
-            fade_baseline: Instant::now(),
-        });
-        self.channels.len() - 1
+        let id = self.active.unwrap_or(NetworkId(0));
+        self.ensure_channel_in(id, name)
     }
 
     fn set_selected(&mut self, i: usize) {
@@ -1719,8 +2006,8 @@ impl App {
         }
     }
 
-    fn push_status(&mut self, msg: ChatMessage) {
-        let idx = self.ensure_channel("&status");
+    fn push_status_in(&mut self, network_id: NetworkId, msg: ChatMessage) {
+        let idx = self.ensure_channel_in(network_id, "&status");
         self.channels[idx].messages.push(msg);
     }
 
@@ -1743,8 +2030,12 @@ impl App {
         if msg_anim || pane_anim || row_anim {
             subs.push(window::frames().map(Message::Tick));
         }
-        if let Some(cfg) = self.cfg.as_ref() {
-            subs.push(Subscription::run_with(cfg.clone(), irc_sub).map(Message::Irc));
+        for net in &self.networks {
+            if !net.autoconnect_enabled {
+                continue;
+            }
+            let key = (net.id, net.cfg.clone());
+            subs.push(Subscription::run_with(key, irc_sub_for_network));
         }
         subs.push(keyboard::listen().map(Message::Key));
         Subscription::batch(subs)
@@ -1754,7 +2045,8 @@ impl App {
         let sw = self.sidebar_anim.interpolate(0.0, SIDEBAR_W, self.now);
         let mw = self.members_anim.interpolate(0.0, MEMBERS_W, self.now);
 
-        let mut panes: Vec<Element<Message>> = Vec::with_capacity(3);
+        let mut panes: Vec<Element<Message>> = Vec::with_capacity(4);
+        panes.push(self.rail());
         if sw > 0.5 {
             panes.push(self.sidebar(sw));
         }
@@ -1880,12 +2172,101 @@ impl App {
             .into()
     }
 
-    fn sidebar(&self, width: f32) -> Element<'_, Message> {
-        let dot_color = status_color(self.status);
-        let label = self
+    fn rail(&self) -> Element<'_, Message> {
+        let buttons: Vec<Element<'_, Message>> = self
+            .networks
+            .iter()
+            .map(|net| self.rail_button(net))
+            .collect();
+
+        let stack_inner = column(buttons)
+            .spacing(tok::S2 as f32)
+            .padding(pad(tok::S3 as f32, 0.0, tok::S3 as f32, 0.0));
+
+        container(scrollable(stack_inner).height(Fill))
+            .width(Length::Fixed(RAIL_W))
+            .height(Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_0())),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn rail_button(&self, net: &NetworkState) -> Element<'_, Message> {
+        let active = self.active == Some(net.id);
+        let hovered = self.hovered_network == Some(net.id);
+        let initial = net
             .cfg
-            .as_ref()
-            .map(|c| c.server.clone())
+            .name
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .next()
+            .unwrap_or('?')
+            .to_string();
+        let bg = nick_color(&net.cfg.name);
+        let dot = status_color(net.status);
+
+        let initial_text = container(
+            text(initial)
+                .size(sz(15.0))
+                .font(medium())
+                .color(Color::WHITE),
+        )
+        .width(Length::Fixed(RAIL_BTN))
+        .height(Length::Fixed(RAIL_BTN))
+        .center_x(Length::Fixed(RAIL_BTN))
+        .center_y(Length::Fixed(RAIL_BTN))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: if active { tok::accent() } else { Color::TRANSPARENT },
+                width: if active { 2.0 } else { 0.0 },
+                radius: if hovered || active { 12.0.into() } else { 9.0.into() },
+            },
+            ..Default::default()
+        });
+
+        let dot_overlay = container(
+            container(sp(8, 8)).style(move |_| container::Style {
+                background: Some(Background::Color(dot)),
+                border: Border {
+                    color: tok::bg_0(),
+                    width: 1.5,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }),
+        )
+        .width(Length::Fixed(RAIL_BTN))
+        .height(Length::Fixed(RAIL_BTN))
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Bottom);
+
+        let stacked = stack![initial_text, dot_overlay];
+
+        let centered = container(stacked)
+            .width(Length::Fixed(RAIL_W))
+            .height(Length::Fixed(RAIL_BTN + 4.0))
+            .center_x(Length::Fixed(RAIL_W))
+            .center_y(Length::Fixed(RAIL_BTN + 4.0));
+
+        let id = net.id;
+        mouse_area(centered)
+            .on_press(Message::NetworkSelected(id))
+            .on_enter(Message::HoverNetwork(Some(id)))
+            .on_exit(Message::HoverNetwork(None))
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
+    }
+
+    fn sidebar(&self, width: f32) -> Element<'_, Message> {
+        let dot_color = status_color(self.current_status());
+        let label = self
+            .active_net()
+            .map(|n| n.cfg.name.clone())
             .unwrap_or_else(|| "not connected".into());
 
         let server_label = container(
@@ -1908,10 +2289,12 @@ impl App {
                 ..Default::default()
             });
 
+        let active_id = self.active;
         let items: Vec<Element<Message>> = self
             .channels
             .iter()
             .enumerate()
+            .filter(|(_, ch)| Some(ch.network_id) == active_id)
             .map(|(i, ch)| self.channel_row(i, ch))
             .collect();
 
@@ -2129,10 +2512,10 @@ impl App {
     }
 
     fn render_messages<'a>(&'a self, ch: &'a Channel) -> Vec<Element<'a, Message>> {
+        // Mentions are scoped to the channel's network, not the global active.
         let my_nick = self
-            .cfg
-            .as_ref()
-            .map(|c| c.nickname.as_str())
+            .net(ch.network_id)
+            .map(|n| n.cfg.nickname.as_str())
             .unwrap_or("");
 
         let baseline = ch.fade_baseline;
@@ -2263,7 +2646,10 @@ impl App {
                 .width(64)
                 .font(medium())
                 .wrapping(iced::widget::text::Wrapping::None);
-            let my_nick = self.cfg.as_ref().map(|c| c.nickname.as_str()).unwrap_or("");
+            let my_nick = self
+                .active_net()
+                .map(|n| n.cfg.nickname.as_str())
+                .unwrap_or("");
             let clickable =
                 m.kind != MsgKind::System && !m.nick.is_empty() && m.nick != my_nick;
             if clickable {

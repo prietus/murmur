@@ -3,7 +3,7 @@ use futures::{SinkExt, Stream, StreamExt};
 use irc::client::prelude::*;
 use irc::proto::CapSubCommand;
 
-use crate::config::{AppConfig, AuthMode};
+use crate::config::{AuthMode, NetworkConfig};
 
 #[derive(Clone)]
 pub enum Outgoing {
@@ -40,7 +40,7 @@ enum AuthPhase {
     Done,
 }
 
-pub fn subscribe(cfg: &AppConfig) -> impl Stream<Item = Event> + Send + 'static {
+pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'static {
     let cfg = cfg.clone();
     iced::stream::channel(128, move |mut out: mpsc::Sender<Event>| async move {
         let (otx, mut orx) = mpsc::channel::<Outgoing>(64);
@@ -189,7 +189,7 @@ fn handle_auth_msg(
     sender: &Sender,
     phase: &mut AuthPhase,
     mode: AuthMode,
-    cfg: &AppConfig,
+    cfg: &NetworkConfig,
 ) -> AuthOutcome {
     match &msg.command {
         Command::CAP(_, sub, third, fourth) if *sub == CapSubCommand::ACK => {

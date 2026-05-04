@@ -2,3 +2,4 @@
 /config.toml
 /.claude
 .DS_Store
+/packaging/arch/.SRCINFO
