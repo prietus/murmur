@@ -71,10 +71,13 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -s \
+            -A -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          echo "Identities in build keychain:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
@@ -82,7 +85,12 @@ jobs:
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          IDENTITY="Developer ID Application: carlos prieto ortiz ($APPLE_TEAM_ID)"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | awk -F\" '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found" >&2
+            exit 1
+          fi
           codesign --force --options runtime --timestamp \
             --entitlements packaging/macos/entitlements.plist \
             --sign "$IDENTITY" \
@@ -102,10 +110,9 @@ jobs:
           echo "DMG=$DMG" >> "$GITHUB_ENV"
 
       - name: Codesign .dmg
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          IDENTITY="Developer ID Application: carlos prieto ortiz ($APPLE_TEAM_ID)"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | awk -F\" '/Developer ID Application/ {print $2; exit}')
           codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
       - name: Notarize
