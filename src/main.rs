@@ -35,6 +35,9 @@ static FONT_SCALE: OnceLock<f32> = OnceLock::new();
 const FADE_MS: u128 = 250;
 const GROUP_SECS: u64 = 300;
 
+const TIME_W: u32 = 44;
+const NICK_W: u32 = 92;
+
 const SIDEBAR_MIN_W: f32 = 130.0;
 const SIDEBAR_MAX_W: f32 = 240.0;
 const MEMBERS_MIN_W: f32 = 110.0;
@@ -340,6 +343,7 @@ enum Message {
     CloseChannel(usize),
     NetworkSelected(NetworkId),
     HoverNetwork(Option<NetworkId>),
+    OpenUrl(String),
 }
 
 #[derive(Clone)]
@@ -353,6 +357,12 @@ enum MediaState {
     Loading,
     Image { handle: iced_image::Handle, w: u32, h: u32 },
     File { kind: MediaKind, content_type: String, size: Option<u64> },
+    LinkCard {
+        title: Option<String>,
+        description: Option<String>,
+        host: String,
+        image: Option<(iced_image::Handle, u32, u32)>,
+    },
     Skipped,
     Error(String),
 }
@@ -930,6 +940,10 @@ impl App {
             }
             Message::HoverNetwork(v) => {
                 self.hovered_network = v;
+                Task::none()
+            }
+            Message::OpenUrl(url) => {
+                open_url(&url);
                 Task::none()
             }
             Message::MediaFetched(fetched) => {
@@ -2566,8 +2580,8 @@ impl App {
 
         container(
             row![
-                sp(44, 0),
-                sp(64, 0),
+                sp(TIME_W, 0),
+                sp(NICK_W, 0),
                 text(m.body.clone())
                     .size(sz(11.0))
                     .color(Color { a: alpha, ..tok::text_muted() })
@@ -2619,22 +2633,22 @@ impl App {
         let nick_color = nick_color(&m.nick);
 
         let time_el: Element<Message> = if grouped {
-            text("").size(sz(11.0)).width(44).into()
+            text("").size(sz(11.0)).width(TIME_W).into()
         } else {
             text(m.time.clone())
                 .size(sz(11.0))
                 .color(Color { a: 0.7 * alpha, ..tok::text_faint() })
-                .width(44)
+                .width(TIME_W)
                 .into()
         };
 
         let nick_el: Element<Message> = if grouped {
-            sp(64, 0).into()
+            sp(NICK_W, 0).into()
         } else {
-            let nick_text = text(truncate(&m.nick, 10))
+            let nick_text = text(truncate(&m.nick, 12))
                 .size(sz(13.0))
                 .color(Color { a: alpha, ..nick_color })
-                .width(64)
+                .width(NICK_W)
                 .font(medium())
                 .wrapping(iced::widget::text::Wrapping::None);
             let my_nick = self
@@ -2658,10 +2672,26 @@ impl App {
         } else {
             (regular(), tok::text())
         };
-        let body_el = text(m.body.clone())
+
+        let segs = body_segments(&m.body);
+        let url_color = Color { a: alpha, ..tok::accent() };
+        let text_color = Color { a: alpha, ..body_color };
+        let spans: Vec<iced::widget::text::Span<String>> = segs
+            .into_iter()
+            .map(|seg| match seg {
+                BodySeg::Text(t) => iced::widget::span(t.to_string())
+                    .color(text_color)
+                    .font(body_font),
+                BodySeg::Url(u) => iced::widget::span(u.to_string())
+                    .color(url_color)
+                    .font(body_font)
+                    .underline(true)
+                    .link(u.to_string()),
+            })
+            .collect();
+        let body_el = iced::widget::rich_text(spans)
             .size(sz(13.0))
-            .color(Color { a: alpha, ..body_color })
-            .font(body_font);
+            .on_link_click(Message::OpenUrl);
 
         let top_pad = if grouped { 0.0 } else { tok::S1 as f32 };
 
@@ -2673,10 +2703,13 @@ impl App {
             .iter()
             .filter_map(|url| match self.media_cache.get(url) {
                 Some(MediaState::Image { handle, w, h }) => {
-                    Some(image_preview(handle.clone(), *w, *h, alpha))
+                    Some(image_preview(url, handle.clone(), *w, *h, alpha))
                 }
                 Some(MediaState::File { kind, content_type, size }) => {
                     Some(file_card(url, *kind, content_type, *size, alpha))
+                }
+                Some(MediaState::LinkCard { title, description, host, image }) => {
+                    Some(link_card(url, title.as_deref(), description.as_deref(), host, image, alpha))
                 }
                 Some(MediaState::Error(e)) => Some(media_error(url, e, alpha)),
                 _ => None,
@@ -2687,7 +2720,7 @@ impl App {
             line_row.into()
         } else {
             let mut col = column![line_row].spacing(tok::S2);
-            let media_indent = 44.0 + 64.0 + tok::S3 as f32 * 2.0;
+            let media_indent = TIME_W as f32 + NICK_W as f32 + tok::S3 as f32 * 2.0;
             for el in media_els {
                 col = col.push(
                     row![sp(media_indent, 0), el].align_y(iced::Alignment::Start),
@@ -2843,6 +2876,68 @@ const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_PREVIEW_W: f32 = 480.0;
 const MAX_PREVIEW_H: f32 = 360.0;
 
+fn open_url(url: &str) {
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    let cmd = Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let cmd = Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let cmd = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    let _ = cmd;
+}
+
+#[derive(Debug)]
+enum BodySeg<'a> {
+    Text(&'a str),
+    Url(&'a str),
+}
+
+/// Splits a chat body into alternating text / URL segments. URL detection
+/// matches the same `http(s)://` prefix rule as `extract_urls` and trims
+/// trailing punctuation so a sentence ending with a link reads naturally.
+fn body_segments(body: &str) -> Vec<BodySeg<'_>> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let rest = &body[cursor..];
+        let next_https = rest.find("https://");
+        let next_http = rest.find("http://");
+        let next_off = match (next_https, next_http) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let abs = match next_off {
+            Some(o) => cursor + o,
+            None => {
+                if cursor < body.len() {
+                    out.push(BodySeg::Text(&body[cursor..]));
+                }
+                break;
+            }
+        };
+        if abs > cursor {
+            out.push(BodySeg::Text(&body[cursor..abs]));
+        }
+        let after = &body[abs..];
+        let token_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let token = &after[..token_end];
+        // Strip trailing punctuation so it stays as text (the URL itself
+        // shouldn't include a sentence-ending period or comma).
+        let trimmed_end = token
+            .trim_end_matches(|c: char| matches!(c, ')' | ']' | '"' | '\'' | ',' | '.' | ';' | ':' | '!' | '?'))
+            .len();
+        out.push(BodySeg::Url(&token[..trimmed_end]));
+        if trimmed_end < token.len() {
+            out.push(BodySeg::Text(&token[trimmed_end..]));
+        }
+        cursor = abs + token.len();
+    }
+    out
+}
+
 fn extract_urls(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     for word in body.split_whitespace() {
@@ -2857,6 +2952,8 @@ fn extract_urls(body: &str) -> Vec<String> {
     }
     out
 }
+
+const MAX_HTML_BYTES: usize = 256 * 1024;
 
 async fn fetch_media(url: String) -> FetchedMedia {
     let make_err = |e: String| FetchedMedia { url: url.clone(), state: MediaState::Error(e) };
@@ -2901,22 +2998,50 @@ async fn fetch_media(url: String) -> FetchedMedia {
                 return make_err(format!("image too large ({})", human_size(sz)));
             }
         }
-        let bytes = match client.get(&url).send().await {
-            Ok(r) => match r.bytes().await {
-                Ok(b) => b,
-                Err(e) => return make_err(e.to_string()),
-            },
-            Err(e) => return make_err(e.to_string()),
-        };
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return make_err("image too large".into());
+        match fetch_image(&client, &url).await {
+            Ok((handle, w, h)) => {
+                return FetchedMedia { url, state: MediaState::Image { handle, w, h } };
+            }
+            Err(e) => return make_err(e),
         }
-        let (w, h) = match image::load_from_memory(&bytes) {
-            Ok(img) => (img.width(), img.height()),
-            Err(e) => return make_err(format!("decode: {e}")),
+    }
+
+    if ct.starts_with("text/html") {
+        // Pull the page, parse OpenGraph / twitter / <title>, then build a
+        // link card. If og:image is present, fetch it as the card's preview.
+        let html = match fetch_html_text(&client, &url).await {
+            Ok(s) => s,
+            Err(_) => return FetchedMedia { url, state: MediaState::Skipped },
         };
-        let handle = iced_image::Handle::from_bytes(bytes.to_vec());
-        return FetchedMedia { url, state: MediaState::Image { handle, w, h } };
+        let meta = parse_html_meta(&html);
+        let title = meta
+            .get("og:title")
+            .or_else(|| meta.get("twitter:title"))
+            .or_else(|| meta.get("title"))
+            .map(|s| collapse_ws(s));
+        let description = meta
+            .get("og:description")
+            .or_else(|| meta.get("twitter:description"))
+            .map(|s| collapse_ws(s));
+        let image_url = meta
+            .get("og:image")
+            .or_else(|| meta.get("twitter:image"))
+            .or_else(|| meta.get("twitter:image:src"))
+            .map(|s| resolve_url(&url, s));
+        let host = url_host(&url).to_string();
+
+        if title.is_none() && description.is_none() && image_url.is_none() {
+            return FetchedMedia { url, state: MediaState::Skipped };
+        }
+
+        let image = match image_url {
+            Some(iu) => fetch_image(&client, &iu).await.ok(),
+            None => None,
+        };
+        return FetchedMedia {
+            url,
+            state: MediaState::LinkCard { title, description, host, image },
+        };
     }
 
     if ct.starts_with("audio/") {
@@ -2932,6 +3057,203 @@ async fn fetch_media(url: String) -> FetchedMedia {
         };
     }
     FetchedMedia { url, state: MediaState::Skipped }
+}
+
+async fn fetch_image(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(iced_image::Handle, u32, u32), String> {
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err("image too large".into());
+    }
+    let (w, h) = image::load_from_memory(&bytes)
+        .map(|img| (img.width(), img.height()))
+        .map_err(|e| format!("decode: {e}"))?;
+    Ok((iced_image::Handle::from_bytes(bytes.to_vec()), w, h))
+}
+
+async fn fetch_html_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > 4 * MAX_HTML_BYTES as u64 {
+            return Err(format!("html too large ({len} bytes)"));
+        }
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let slice = &bytes[..bytes.len().min(MAX_HTML_BYTES)];
+    Ok(String::from_utf8_lossy(slice).into_owned())
+}
+
+/// Extracts og:*, twitter:*, and <title> from raw HTML using a tiny
+/// hand-rolled parser. Robust enough for well-formed meta tags; not a
+/// real HTML parser.
+fn parse_html_meta(html: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let lower = html.to_ascii_lowercase();
+
+    // <title>…</title>
+    if let Some(start) = lower.find("<title") {
+        if let Some(gt) = lower[start..].find('>') {
+            let after = start + gt + 1;
+            if let Some(end_rel) = lower[after..].find("</title>") {
+                let raw = &html[after..after + end_rel];
+                out.insert("title".into(), html_decode(raw));
+            }
+        }
+    }
+
+    // <meta …>
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("<meta") {
+        let start = i + rel;
+        let after_tag = start + 5;
+        if after_tag >= bytes.len() {
+            break;
+        }
+        // tag must have whitespace or '/' or '>' right after "<meta"
+        let next = bytes[after_tag];
+        if !next.is_ascii_whitespace() && next != b'/' && next != b'>' {
+            i = after_tag;
+            continue;
+        }
+        let close = match lower[after_tag..].find('>') {
+            Some(p) => after_tag + p,
+            None => break,
+        };
+        let attrs = &html[after_tag..close];
+        i = close + 1;
+
+        let key = extract_attr(attrs, "property")
+            .or_else(|| extract_attr(attrs, "name"))
+            .map(|s| s.to_ascii_lowercase());
+        let content = extract_attr(attrs, "content");
+        if let (Some(k), Some(v)) = (key, content) {
+            // Keep og:*, twitter:*, and the bare description.
+            if k.starts_with("og:") || k.starts_with("twitter:") || k == "description" {
+                out.entry(k).or_insert(html_decode(&v));
+            }
+        }
+    }
+    out
+}
+
+/// Pulls a single attribute's quoted value from a meta-tag's attribute
+/// substring. Tolerates either single or double quotes and handles a
+/// few attributes appearing in any order.
+fn extract_attr(attrs: &str, name: &str) -> Option<String> {
+    let lower = attrs.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(name) {
+        let pos = from + rel;
+        // must be at start or preceded by whitespace
+        let prev_ok = pos == 0
+            || attrs.as_bytes()[pos - 1].is_ascii_whitespace()
+            || attrs.as_bytes()[pos - 1] == b'/';
+        let after = pos + name.len();
+        if !prev_ok || after >= attrs.len() {
+            from = after;
+            continue;
+        }
+        // skip whitespace, then expect '='
+        let bytes = attrs.as_bytes();
+        let mut j = after;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'=' {
+            from = after;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return None;
+        }
+        let q = bytes[j];
+        if q == b'"' || q == b'\'' {
+            j += 1;
+            let end = attrs[j..].find(q as char).map(|p| j + p)?;
+            return Some(attrs[j..end].to_string());
+        } else {
+            let end = attrs[j..]
+                .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+                .map(|p| j + p)
+                .unwrap_or(attrs.len());
+            return Some(attrs[j..end].to_string());
+        }
+    }
+    None
+}
+
+fn html_decode(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for c in s.trim().chars() {
+        let ws = c.is_whitespace();
+        if ws {
+            if !prev_ws {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+        prev_ws = ws;
+    }
+    out
+}
+
+/// Resolves a possibly-relative URL against a base. Handles absolute
+/// (https://, http://), protocol-relative (//host/...), root-relative
+/// (/path), and same-dir relative paths well enough for og:image use.
+fn resolve_url(base: &str, target: &str) -> String {
+    let t = target.trim();
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return t.to_string();
+    }
+    if let Some(rest) = t.strip_prefix("//") {
+        let scheme = if base.starts_with("http://") { "http" } else { "https" };
+        return format!("{scheme}://{rest}");
+    }
+    let scheme = if base.starts_with("http://") { "http" } else { "https" };
+    let host = url_host(base);
+    if let Some(rest) = t.strip_prefix('/') {
+        return format!("{scheme}://{host}/{rest}");
+    }
+    // same-dir relative: drop last path segment of base.
+    let path_start = base.find("://").map(|p| p + 3).unwrap_or(0);
+    let after_host = base[path_start..]
+        .find('/')
+        .map(|p| path_start + p)
+        .unwrap_or(base.len());
+    let dir_end = base[..after_host].len()
+        + base[after_host..]
+            .rfind('/')
+            .map(|p| p + 1)
+            .unwrap_or(1);
+    format!("{}{}", &base[..dir_end.min(base.len())], t)
 }
 
 fn human_size(bytes: u64) -> String {
@@ -2968,6 +3290,7 @@ fn url_filename(url: &str) -> &str {
 }
 
 fn image_preview<'a>(
+    url: &str,
     handle: iced_image::Handle,
     w: u32,
     h: u32,
@@ -2978,7 +3301,7 @@ fn image_preview<'a>(
         .min(1.0);
     let display_w = (w as f32 * scale).max(1.0);
     let display_h = (h as f32 * scale).max(1.0);
-    container(
+    let img = container(
         iced_image(handle)
             .width(Length::Fixed(display_w))
             .height(Length::Fixed(display_h))
@@ -2991,8 +3314,12 @@ fn image_preview<'a>(
         border: Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     })
-    .clip(true)
-    .into()
+    .clip(true);
+    let url = url.to_string();
+    mouse_area(img)
+        .on_press(Message::OpenUrl(url))
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
 }
 
 fn file_card<'a>(
@@ -3008,13 +3335,14 @@ fn file_card<'a>(
     };
     let title = url_filename(url).to_string();
     let host = url_host(url).to_string();
+    let url_owned = url.to_string();
 
     let meta = match size {
         Some(s) => format!("{} · {} · {}", content_type, human_size(s), host),
         None => format!("{content_type} · {host}"),
     };
 
-    container(
+    let card = container(
         row![
             container(text(icon).size(sz(20.0)).color(Color { a: alpha, ..tok::text() }))
                 .width(Length::Fixed(40.0))
@@ -3052,8 +3380,129 @@ fn file_card<'a>(
             radius: 8.0.into(),
         },
         ..Default::default()
-    })
-    .into()
+    });
+    mouse_area(card)
+        .on_press(Message::OpenUrl(url_owned))
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+}
+
+fn link_card<'a>(
+    url: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    host: &str,
+    image: &Option<(iced_image::Handle, u32, u32)>,
+    alpha: f32,
+) -> Element<'a, Message> {
+    let url_owned = url.to_string();
+    use iced::widget::text::Wrapping;
+
+    // Hide the title if any meaningful slice of it shows up in the
+    // description (common on GitHub repos where og:title is
+    // "Owner/repo: <description>" and og:description repeats the same
+    // text). Check both halves of the title around an optional colon.
+    let title = title.filter(|t| {
+        let t = t.trim();
+        if t.is_empty() {
+            return false;
+        }
+        let Some(d) = description else { return true };
+        let d_lower = d.to_lowercase();
+        let t_lower = t.to_lowercase();
+        let chunks: Vec<&str> = t_lower
+            .split(':')
+            .map(str::trim)
+            .filter(|s| s.len() >= 12)
+            .collect();
+        // If any chunk's first 24 chars appear in description, the
+        // title isn't adding information.
+        for c in chunks {
+            let head: String = c.chars().take(24).collect();
+            if d_lower.contains(&head) {
+                return false;
+            }
+        }
+        true
+    });
+
+    let header = text(host.to_string())
+        .size(sz(11.0))
+        .color(Color { a: alpha * 0.85, ..tok::text_faint() })
+        .font(medium())
+        .wrapping(Wrapping::None);
+
+    let mut body = column![header].spacing(2).width(Length::Fill);
+    if let Some(t) = title {
+        body = body.push(
+            text(truncate(t, 70))
+                .size(sz(13.0))
+                .color(Color { a: alpha, ..tok::text() })
+                .font(medium())
+                .wrapping(Wrapping::Word)
+                .width(Length::Fill),
+        );
+    }
+    if let Some(d) = description.filter(|s| !s.is_empty()) {
+        body = body.push(
+            text(truncate(d, 200))
+                .size(sz(11.0))
+                .color(Color { a: alpha * 0.9, ..tok::text_muted() })
+                .wrapping(Wrapping::Word)
+                .width(Length::Fill),
+        );
+    }
+
+    let card_inner: Element<Message> = match image {
+        Some((handle, w, h)) => {
+            // Aspect-aware thumbnail: max 128x96, never upscaled. Wide
+            // images (GitHub, YouTube) get ~128x68; tall images
+            // (vertical photos) get ~64x96; square images get ~96x96.
+            const MAX_W: f32 = 128.0;
+            const MAX_H: f32 = 96.0;
+            let scale = (MAX_W / *w as f32).min(MAX_H / *h as f32).min(1.0);
+            let dw = (*w as f32 * scale).max(1.0);
+            let dh = (*h as f32 * scale).max(1.0);
+            let thumb = container(
+                iced_image(handle.clone())
+                    .width(Length::Fixed(dw))
+                    .height(Length::Fixed(dh))
+                    .content_fit(ContentFit::Contain)
+                    .opacity(alpha),
+            )
+            .width(Length::Fixed(dw))
+            .height(Length::Fixed(dh))
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_hover())),
+                border: Border { radius: 6.0.into(), ..Default::default() },
+                ..Default::default()
+            })
+            .clip(true);
+            row![body, thumb]
+                .spacing(tok::S3)
+                .align_y(iced::Alignment::Start)
+                .into()
+        }
+        None => body.into(),
+    };
+
+    let card = container(card_inner)
+        .padding(pad(tok::S3 as f32, tok::S3 as f32, tok::S3 as f32, tok::S3 as f32))
+        .max_width(MAX_PREVIEW_W)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(tok::bg_elev())),
+            border: Border {
+                color: tok::border_soft(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .clip(true);
+    mouse_area(card)
+        .on_press(Message::OpenUrl(url_owned))
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
 }
 
 fn media_error<'a>(url: &str, msg: &str, alpha: f32) -> Element<'a, Message> {
