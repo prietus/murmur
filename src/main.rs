@@ -306,37 +306,6 @@ fn blend(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-struct TileStyle {
-    bg: Color,
-    fg: Color,
-    border: Color,
-    border_width: f32,
-}
-
-fn tile_style_for(hover_v: f32, select_v: f32) -> TileStyle {
-    let bg = blend(
-        blend(tok::bg_elev(), tok::bg_hover(), hover_v),
-        tok::accent_soft(),
-        select_v,
-    );
-    let fg = blend(
-        blend(tok::text_mid(), tok::text(), hover_v),
-        tok::accent(),
-        select_v,
-    );
-    let border = blend(
-        blend(tok::border_soft(), tok::border(), hover_v),
-        Color::TRANSPARENT,
-        select_v,
-    );
-    TileStyle {
-        bg,
-        fg,
-        border,
-        border_width: 1.0 * (1.0 - select_v),
-    }
-}
-
 fn channel_parts(name: &str) -> (&'static str, String) {
     if let Some(rest) = name.strip_prefix("##") {
         return ("#", rest.to_string());
@@ -348,30 +317,6 @@ fn channel_parts(name: &str) -> (&'static str, String) {
         return ("•", rest.to_string());
     }
     ("@", name.to_string())
-}
-
-fn channel_tile(
-    prefix: &'static str,
-    style: TileStyle,
-    side: f32,
-    font_size: f32,
-) -> Element<'static, Message> {
-    let TileStyle { bg, fg, border, border_width } = style;
-    container(text(prefix).size(font_size).color(fg).font(medium()))
-        .width(Length::Fixed(side))
-        .height(Length::Fixed(side))
-        .align_x(iced::alignment::Horizontal::Center)
-        .align_y(iced::alignment::Vertical::Center)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(bg)),
-            border: Border {
-                color: border,
-                width: border_width,
-                radius: (side * 0.28).into(),
-            },
-            ..Default::default()
-        })
-        .into()
 }
 
 #[derive(Clone)]
@@ -519,6 +464,8 @@ struct ChatMessage {
     inserted_at: Instant,
     mono_secs: u64,
     kind: MsgKind,
+    #[allow(dead_code)]
+    msgid: Option<String>,
 }
 
 impl Default for App {
@@ -691,6 +638,7 @@ fn system_line(body: &str, now: Instant) -> ChatMessage {
         inserted_at: now,
         mono_secs: 0,
         kind: MsgKind::System,
+        msgid: None,
     }
 }
 
@@ -703,6 +651,26 @@ fn joinpart_line(body: &str, now: Instant) -> ChatMessage {
         inserted_at: now,
         mono_secs: now.elapsed().as_secs(),
         kind: MsgKind::JoinPart,
+        msgid: None,
+    }
+}
+
+fn chat_line_from_meta(
+    nick: String,
+    body: String,
+    kind: MsgKind,
+    meta: &irc_worker::MsgMeta,
+    now: Instant,
+) -> ChatMessage {
+    ChatMessage {
+        nick,
+        body,
+        time: meta.server_time_hhmm.clone().unwrap_or_else(now_hhmm),
+        day: "today".into(),
+        inserted_at: now,
+        mono_secs: now.elapsed().as_secs(),
+        kind,
+        msgid: meta.msgid.clone(),
     }
 }
 
@@ -934,6 +902,7 @@ impl App {
                         inserted_at: now,
                         mono_secs: now.elapsed().as_secs(),
                         kind: MsgKind::Chat,
+                        msgid: None,
                     });
                     self.now = now;
                     return fetch;
@@ -1430,6 +1399,7 @@ impl App {
             inserted_at: now,
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Action,
+            msgid: None,
         });
     }
 
@@ -1462,6 +1432,7 @@ impl App {
             inserted_at: now,
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Chat,
+            msgid: None,
         });
         self.set_selected(idx);
     }
@@ -1810,7 +1781,7 @@ impl App {
                 self.push_status_in(network_id, system_line("disconnected", now));
                 Task::none()
             }
-            IrcEvent::Privmsg { target, nick, body } => {
+            IrcEvent::Privmsg { target, nick, body, meta } => {
                 let my_nick = self
                     .net(network_id)
                     .map(|n| n.cfg.nickname.clone())
@@ -1832,18 +1803,16 @@ impl App {
                     &bucket,
                     &format!("{}  <{}> {}", chatlog::iso_now(), nick, body),
                 );
-                self.channels[idx].messages.push(ChatMessage {
+                self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
-                    time: now_hhmm(),
-                    day: "today".into(),
-                    inserted_at: now,
-                    mono_secs: now.elapsed().as_secs(),
-                    kind: MsgKind::Chat,
-                });
+                    MsgKind::Chat,
+                    &meta,
+                    now,
+                ));
                 fetch
             }
-            IrcEvent::Action { target, nick, body } => {
+            IrcEvent::Action { target, nick, body, meta } => {
                 let my_nick = self
                     .net(network_id)
                     .map(|n| n.cfg.nickname.clone())
@@ -1865,18 +1834,16 @@ impl App {
                     &bucket,
                     &format!("{}  * {} {}", chatlog::iso_now(), nick, body),
                 );
-                self.channels[idx].messages.push(ChatMessage {
+                self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
-                    time: now_hhmm(),
-                    day: "today".into(),
-                    inserted_at: now,
-                    mono_secs: now.elapsed().as_secs(),
-                    kind: MsgKind::Action,
-                });
+                    MsgKind::Action,
+                    &meta,
+                    now,
+                ));
                 fetch
             }
-            IrcEvent::NickChanged { old, new } => {
+            IrcEvent::NickChanged { old, new, meta: _ } => {
                 let is_self = self
                     .net(network_id)
                     .is_some_and(|n| n.cfg.nickname == old);
@@ -1904,32 +1871,36 @@ impl App {
                 }
                 Task::none()
             }
-            IrcEvent::UserJoined { channel, nick } => {
+            IrcEvent::UserJoined { channel, nick, meta } => {
                 let idx = self.ensure_channel_in(network_id, &channel);
                 if !self.channels[idx].members.iter().any(|n| n == &nick) {
                     self.channels[idx].members.push(nick.clone());
                 }
-                chatlog::append(
-                    &net_name,
-                    &channel,
-                    &format!("{}  -- {} joined", chatlog::iso_now(), nick),
-                );
-                self.channels[idx]
-                    .messages
-                    .push(joinpart_line(&format!("→ {nick} joined"), now));
+                if meta.batch.is_none() {
+                    chatlog::append(
+                        &net_name,
+                        &channel,
+                        &format!("{}  -- {} joined", chatlog::iso_now(), nick),
+                    );
+                    self.channels[idx]
+                        .messages
+                        .push(joinpart_line(&format!("→ {nick} joined"), now));
+                }
                 Task::none()
             }
-            IrcEvent::UserLeft { channel, nick } => {
+            IrcEvent::UserLeft { channel, nick, meta } => {
                 let idx = self.ensure_channel_in(network_id, &channel);
                 self.channels[idx].members.retain(|n| n != &nick);
-                chatlog::append(
-                    &net_name,
-                    &channel,
-                    &format!("{}  -- {} left", chatlog::iso_now(), nick),
-                );
-                self.channels[idx]
-                    .messages
-                    .push(joinpart_line(&format!("← {nick} left"), now));
+                if meta.batch.is_none() {
+                    chatlog::append(
+                        &net_name,
+                        &channel,
+                        &format!("{}  -- {} left", chatlog::iso_now(), nick),
+                    );
+                    self.channels[idx]
+                        .messages
+                        .push(joinpart_line(&format!("← {nick} left"), now));
+                }
                 Task::none()
             }
             IrcEvent::Names { channel, nicks } => {
@@ -1951,7 +1922,7 @@ impl App {
                 self.channels[idx].topic = Some(topic);
                 Task::none()
             }
-            IrcEvent::Notice { from, text } => {
+            IrcEvent::Notice { from, text, meta: _ } => {
                 self.push_status_in(network_id, system_line(&format!("-{from}- {text}"), now));
                 Task::none()
             }
@@ -2042,22 +2013,22 @@ impl App {
     }
 
     fn sidebar_target_width(&self) -> f32 {
-        let mut longest: usize = 6;
-        for n in &self.networks {
-            let chars = truncate(&n.cfg.name, 14).chars().count();
-            longest = longest.max(chars);
-        }
-        let active_id = self.active;
+        let mut longest_chan: usize = 6;
         for ch in &self.channels {
-            if Some(ch.network_id) == active_id {
+            if Some(ch.network_id) == self.active {
                 let (_, label) = channel_parts(&ch.name);
                 let chars = truncate(&label, 18).chars().count();
-                longest = longest.max(chars);
+                longest_chan = longest_chan.max(chars);
             }
         }
-        // Tile (22) + spacing + label width + dot reservation + paddings.
-        let char_w = sz(13.0) * 0.62;
-        let w = 22.0 + 10.0 + (longest as f32 * char_w) + 14.0 + 16.0 + 12.0;
+        let mut longest_net: usize = 0;
+        for n in &self.networks {
+            let chars = truncate(&n.cfg.name, 14).chars().count();
+            longest_net = longest_net.max(chars);
+        }
+        let chan_w = sz(13.0) * 0.62 * (longest_chan as f32 + 1.0) + 14.0; // +# prefix
+        let net_w = sz(11.0) * 0.7 * (longest_net as f32) + 16.0; // dot + spacing
+        let w = chan_w.max(net_w) + 16.0 + 12.0; // button h-pad + section h-pad
         w.clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W)
     }
 
@@ -2209,70 +2180,35 @@ impl App {
 
     fn network_row(&self, net: &NetworkState) -> Element<'_, Message> {
         let active = self.active == Some(net.id);
-        let initial = net
-            .cfg
-            .name
-            .chars()
-            .next()
-            .unwrap_or('?')
-            .to_uppercase()
-            .next()
-            .unwrap_or('?')
-            .to_string();
-        let bg = nick_color(&net.cfg.name);
         let dot = status_color(net.status);
 
-        // Same 22px tile size as channel_row's `[#]` tile so they line up.
-        let avatar = container(
-            text(initial)
-                .size(sz(11.0))
-                .font(medium())
-                .color(Color::WHITE),
-        )
-        .width(Length::Fixed(22.0))
-        .height(Length::Fixed(22.0))
-        .center_x(Length::Fixed(22.0))
-        .center_y(Length::Fixed(22.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(bg)),
-            border: Border { radius: 6.0.into(), ..Default::default() },
-            ..Default::default()
-        });
-
-        let label_color = if active { tok::text() } else { tok::text_mid() };
+        let label_color = if active { tok::text_mid() } else { tok::text_faint() };
 
         let row_content = row![
-            avatar,
-            text(truncate(&net.cfg.name, 14))
-                .size(sz(13.0))
-                .font(if active { medium() } else { regular() })
+            container(sp(5, 5)).style(move |_| container::Style {
+                background: Some(Background::Color(dot)),
+                border: Border { radius: 2.5.into(), ..Default::default() },
+                ..Default::default()
+            }),
+            text(truncate(&net.cfg.name, 14).to_uppercase())
+                .size(sz(11.0))
+                .font(medium())
                 .color(label_color)
                 .wrapping(iced::widget::text::Wrapping::None),
             sp(Fill, 0),
-            container(sp(6, 6)).style(move |_| container::Style {
-                background: Some(Background::Color(dot)),
-                border: Border { radius: 3.0.into(), ..Default::default() },
-                ..Default::default()
-            }),
         ]
-        .spacing(tok::S3)
+        .spacing(tok::S2)
         .align_y(iced::Alignment::Center);
-
-        let row_bg = if active {
-            tok::accent_soft()
-        } else {
-            Color::TRANSPARENT
-        };
 
         let id = net.id;
         let btn = button(row_content)
             .on_press(Message::NetworkSelected(id))
             .width(Fill)
-            .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S2 as f32))
+            .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S1 as f32, tok::S3 as f32))
             .style(move |_theme, _status| button::Style {
-                background: Some(Background::Color(row_bg)),
+                background: Some(Background::Color(Color::TRANSPARENT)),
                 text_color: tok::text(),
-                border: Border { radius: 6.0.into(), ..Default::default() },
+                border: Border { radius: 4.0.into(), ..Default::default() },
                 shadow: Shadow::default(),
                 ..Default::default()
             });
@@ -2296,33 +2232,27 @@ impl App {
             let dot = status_color(self.current_status());
             container(
                 row![
-                    container(sp(6, 6)).style(move |_| container::Style {
+                    container(sp(5, 5)).style(move |_| container::Style {
                         background: Some(Background::Color(dot)),
-                        border: Border { radius: 3.0.into(), ..Default::default() },
+                        border: Border { radius: 2.5.into(), ..Default::default() },
                         ..Default::default()
                     }),
-                    text("not connected")
-                        .size(sz(12.0))
+                    text("NOT CONNECTED")
+                        .size(sz(11.0))
                         .font(medium())
-                        .color(tok::text_muted()),
+                        .color(tok::text_faint()),
                 ]
                 .spacing(tok::S2)
                 .align_y(iced::Alignment::Center),
             )
-            .padding(pad(tok::S4, tok::S4, tok::S3, tok::S4))
+            .padding(pad(tok::S3 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32))
             .into()
         } else {
             column(network_rows)
                 .spacing(0)
-                .padding(pad(tok::S2 as f32, tok::S2 as f32, tok::S2 as f32, tok::S2 as f32))
+                .padding(pad(tok::S3 as f32, tok::S1 as f32, tok::S1 as f32, tok::S1 as f32))
                 .into()
         };
-
-        let divider = container(sp(Fill, 1))
-            .style(|_| container::Style {
-                background: Some(Background::Color(tok::border_soft())),
-                ..Default::default()
-            });
 
         let active_id = self.active;
         let items: Vec<Element<Message>> = self
@@ -2336,12 +2266,12 @@ impl App {
         let list = scrollable(
             column(items)
                 .spacing(0)
-                .padding(pad(tok::S2 as f32, tok::S2 as f32, tok::S2 as f32, tok::S2 as f32)),
+                .padding(pad(tok::S1 as f32, tok::S1 as f32, tok::S2 as f32, tok::S1 as f32)),
         )
         .height(Fill);
 
         container(
-            container(column![networks_section, divider, list].spacing(0))
+            container(column![networks_section, list].spacing(0))
                 .width(Length::Fixed(target))
                 .height(Fill)
                 .style(|_| container::Style {
@@ -2363,8 +2293,8 @@ impl App {
         let hover_v = ch.hover_anim.interpolate(0.0f32, 1.0f32, now);
         let select_v = ch.select_anim.interpolate(0.0f32, 1.0f32, now);
 
-        let tile = tile_style_for(hover_v, select_v);
         let label_color = blend(tok::text_mid(), tok::text(), hover_v.max(select_v));
+        let prefix_color = blend(tok::text_faint(), tok::text_muted(), hover_v.max(select_v));
         let row_bg = blend(
             blend(Color::TRANSPARENT, tok::bg_hover(), hover_v),
             tok::accent_soft(),
@@ -2372,24 +2302,28 @@ impl App {
         );
 
         let row_content = row![
-            channel_tile(prefix, tile, 22.0, sz(11.0)),
+            text(prefix)
+                .size(sz(13.0))
+                .font(regular())
+                .color(prefix_color)
+                .width(Length::Fixed(12.0)),
             text(truncate(&label, 18))
                 .size(sz(13.0))
                 .font(if selected { medium() } else { regular() })
                 .wrapping(iced::widget::text::Wrapping::None)
                 .color(label_color),
         ]
-        .spacing(tok::S3)
+        .spacing(tok::S1)
         .align_y(iced::Alignment::Center);
 
         let btn = button(row_content)
             .on_press(Message::ChannelSelected(i))
             .width(Fill)
-            .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S2 as f32))
+            .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S3 as f32))
             .style(move |_theme, _status| button::Style {
                 background: Some(Background::Color(row_bg)),
                 text_color: tok::text(),
-                border: Border { radius: 6.0.into(), ..Default::default() },
+                border: Border { radius: 4.0.into(), ..Default::default() },
                 shadow: Shadow::default(),
                 ..Default::default()
             });
@@ -2459,12 +2393,12 @@ impl App {
         };
 
         let header_title: Element<Message> = row![
-            channel_tile(prefix, tile_style_for(0.0, 1.0), 20.0, sz(11.0)),
+            text(prefix).size(sz(13.0)).font(regular()).color(tok::text_muted()),
             text(label).size(sz(13.0)).font(medium()).color(tok::text()),
             sp(tok::S3, 0),
             meta_el,
         ]
-        .spacing(tok::S2)
+        .spacing(tok::S1)
         .align_y(iced::Alignment::Center)
         .into();
         let header_topic: Element<Message> = match &ch.topic {

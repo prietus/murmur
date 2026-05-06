@@ -1,9 +1,32 @@
+use std::collections::{HashMap, HashSet};
+
 use futures::channel::mpsc;
 use futures::{SinkExt, Stream, StreamExt};
 use irc::client::prelude::*;
 use irc::proto::CapSubCommand;
+use irc::proto::message::Tag;
 
 use crate::config::{AuthMode, NetworkConfig};
+
+const WANT_EXTRA_CAPS: &[&str] =
+    &["message-tags", "server-time", "batch", "invite-notify"];
+
+/// Per-message metadata extracted from IRCv3 tags.
+#[derive(Clone, Default, Debug)]
+pub struct MsgMeta {
+    /// HH:MM extracted from the `time` tag if present (UTC).
+    pub server_time_hhmm: Option<String>,
+    /// Unique server-issued message id from the `msgid` tag.
+    pub msgid: Option<String>,
+    /// Batch reference tag if this message belongs to an open batch.
+    pub batch: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BatchInfo {
+    kind: String,
+    params: Vec<String>,
+}
 
 #[derive(Clone)]
 pub enum Outgoing {
@@ -16,19 +39,20 @@ pub enum Outgoing {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum Event {
     Ready(mpsc::Sender<Outgoing>),
     Connected,
     ConnectError(String),
     Disconnected,
-    Privmsg { target: String, nick: String, body: String },
-    Action { target: String, nick: String, body: String },
-    UserJoined { channel: String, nick: String },
-    UserLeft { channel: String, nick: String },
-    NickChanged { old: String, new: String },
+    Privmsg { target: String, nick: String, body: String, meta: MsgMeta },
+    Action { target: String, nick: String, body: String, meta: MsgMeta },
+    UserJoined { channel: String, nick: String, meta: MsgMeta },
+    UserLeft { channel: String, nick: String, meta: MsgMeta },
+    NickChanged { old: String, new: String, meta: MsgMeta },
     Names { channel: String, nicks: Vec<String> },
     Topic { channel: String, topic: String },
-    Notice { from: String, text: String },
+    Notice { from: String, text: String, meta: MsgMeta },
     CtcpReply { from: String, query: String, args: String },
 }
 
@@ -38,6 +62,11 @@ enum AuthPhase {
     AwaitingChallenge,
     AwaitingResult,
     Done,
+}
+
+#[derive(Debug, Default)]
+struct CapState {
+    acked: HashSet<String>,
 }
 
 pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'static {
@@ -84,16 +113,28 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
             }
         };
 
-        let mut auth_phase;
+        // Always pause registration and request our wanted caps.
+        // SASL piggybacks on the same REQ when needed.
+        let mut wanted: Vec<String> =
+            WANT_EXTRA_CAPS.iter().map(|s| s.to_string()).collect();
+        if use_sasl {
+            wanted.push("sasl".to_string());
+        }
+        let req_str = wanted.join(" ");
+        if let Err(e) = sender.send(Command::CAP(
+            None,
+            CapSubCommand::REQ,
+            None,
+            Some(req_str),
+        )) {
+            let _ = out.send(Event::ConnectError(e.to_string())).await;
+            return;
+        }
+        let mut auth_phase = AuthPhase::AwaitingCapAck;
+        let mut cap_state = CapState::default();
+        let mut batches: HashMap<String, BatchInfo> = HashMap::new();
 
         if use_sasl {
-            // Pause registration and request SASL. Server replies with
-            // CAP * ACK :sasl, then we drive AUTHENTICATE inside the loop.
-            if let Err(e) = sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some("sasl".to_string()))) {
-                let _ = out.send(Event::ConnectError(e.to_string())).await;
-                return;
-            }
-            auth_phase = AuthPhase::AwaitingCapAck;
             let mech = match auth_mode {
                 AuthMode::SaslExternal => "EXTERNAL",
                 _ => "PLAIN",
@@ -102,15 +143,9 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                 .send(Event::Notice {
                     from: "*".into(),
                     text: format!("authenticating with SASL {mech}…"),
+                    meta: MsgMeta::default(),
                 })
                 .await;
-        } else {
-            if let Err(e) = client.identify() {
-                let _ = out.send(Event::ConnectError(e.to_string())).await;
-                return;
-            }
-            let _ = out.send(Event::Connected).await;
-            auth_phase = AuthPhase::Done;
         }
 
         loop {
@@ -118,8 +153,21 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                 incoming = stream.next() => match incoming {
                     Some(Ok(msg)) => {
                         if auth_phase != AuthPhase::Done {
-                            match handle_auth_msg(&msg, &sender, &mut auth_phase, auth_mode, &cfg) {
+                            match handle_auth_msg(
+                                &msg, &sender, &mut auth_phase, auth_mode,
+                                &cfg, &mut cap_state,
+                            ) {
                                 AuthOutcome::Pending => {}
+                                AuthOutcome::NeedIdentify => {
+                                    if let Err(e) = client.identify() {
+                                        let _ = out
+                                            .send(Event::ConnectError(e.to_string()))
+                                            .await;
+                                        return;
+                                    }
+                                    auth_phase = AuthPhase::Done;
+                                    let _ = out.send(Event::Connected).await;
+                                }
                                 AuthOutcome::Done => {
                                     let _ = out.send(Event::Connected).await;
                                 }
@@ -132,6 +180,39 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                             if is_auth_wire(&msg) {
                                 continue;
                             }
+                        }
+                        // Intercept BATCH for netsplit/netjoin grouping; produce
+                        // a single summary Notice on close instead of letting
+                        // dozens of QUIT/JOIN lines through individually.
+                        if let Command::BATCH(ref tag_with_sign, ref sub, ref params) =
+                            msg.command
+                        {
+                            if let Some(id) = tag_with_sign.strip_prefix('+') {
+                                let kind = sub
+                                    .as_ref()
+                                    .map(|s| s.to_str().to_ascii_lowercase())
+                                    .unwrap_or_default();
+                                batches.insert(
+                                    id.to_string(),
+                                    BatchInfo {
+                                        kind,
+                                        params: params.clone().unwrap_or_default(),
+                                    },
+                                );
+                            } else if let Some(id) = tag_with_sign.strip_prefix('-') {
+                                if let Some(info) = batches.remove(id) {
+                                    if let Some(text) = batch_summary(&info) {
+                                        let _ = out
+                                            .send(Event::Notice {
+                                                from: "*".into(),
+                                                text,
+                                                meta: MsgMeta::default(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            continue;
                         }
                         for ev in translate(msg) {
                             if out.send(ev).await.is_err() {
@@ -180,6 +261,7 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
 
 enum AuthOutcome {
     Pending,
+    NeedIdentify,
     Done,
     Failed(String),
 }
@@ -190,7 +272,9 @@ fn handle_auth_msg(
     phase: &mut AuthPhase,
     mode: AuthMode,
     cfg: &NetworkConfig,
+    caps: &mut CapState,
 ) -> AuthOutcome {
+    let use_sasl = matches!(mode, AuthMode::SaslPlain | AuthMode::SaslExternal);
     match &msg.command {
         Command::CAP(_, sub, third, fourth) if *sub == CapSubCommand::ACK => {
             if *phase != AuthPhase::AwaitingCapAck {
@@ -203,21 +287,34 @@ fn handle_auth_msg(
                 .as_deref()
                 .or(third.as_deref())
                 .unwrap_or("");
-            if !listed.split_whitespace().any(|c| c.eq_ignore_ascii_case("sasl")) {
-                return AuthOutcome::Failed("server ACKed CAP without sasl".into());
+            for cap in listed.split_whitespace() {
+                caps.acked.insert(cap.to_ascii_lowercase());
             }
-            let mech = match mode {
-                AuthMode::SaslExternal => "EXTERNAL",
-                _ => "PLAIN",
-            };
-            if let Err(e) = sender.send(Command::AUTHENTICATE(mech.to_string())) {
-                return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+            if use_sasl {
+                if !caps.acked.contains("sasl") {
+                    return AuthOutcome::Failed("server ACKed CAP without sasl".into());
+                }
+                let mech = match mode {
+                    AuthMode::SaslExternal => "EXTERNAL",
+                    _ => "PLAIN",
+                };
+                if let Err(e) = sender.send(Command::AUTHENTICATE(mech.to_string())) {
+                    return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+                }
+                *phase = AuthPhase::AwaitingChallenge;
+                AuthOutcome::Pending
+            } else {
+                AuthOutcome::NeedIdentify
             }
-            *phase = AuthPhase::AwaitingChallenge;
-            AuthOutcome::Pending
         }
         Command::CAP(_, sub, _, _) if *sub == CapSubCommand::NAK => {
-            AuthOutcome::Failed("server refused SASL capability".into())
+            // Atomic NAK on the combined REQ. For SASL flow this is fatal;
+            // for plain registration, just proceed without extras.
+            if use_sasl {
+                AuthOutcome::Failed("server refused SASL capability".into())
+            } else {
+                AuthOutcome::NeedIdentify
+            }
         }
         Command::AUTHENTICATE(data) if *phase == AuthPhase::AwaitingChallenge => {
             if data != "+" {
@@ -368,33 +465,95 @@ fn b64_encode(input: &[u8]) -> String {
     out
 }
 
+fn extract_meta(tags: &Option<Vec<Tag>>) -> MsgMeta {
+    let mut m = MsgMeta::default();
+    let Some(list) = tags.as_ref() else { return m };
+    for Tag(k, v) in list {
+        match k.as_str() {
+            "time" => {
+                if let Some(val) = v.as_deref() {
+                    m.server_time_hhmm = parse_iso_hhmm(val);
+                }
+            }
+            "msgid" => m.msgid = v.clone(),
+            "batch" => m.batch = v.clone(),
+            _ => {}
+        }
+    }
+    m
+}
+
+fn batch_summary(info: &BatchInfo) -> Option<String> {
+    let s1 = info.params.first().map(String::as_str).unwrap_or("?");
+    let s2 = info.params.get(1).map(String::as_str).unwrap_or("?");
+    match info.kind.as_str() {
+        "netsplit" => Some(format!("netsplit: {s1} ↮ {s2}")),
+        "netjoin" => Some(format!("netjoin: {s1} ↔ {s2}")),
+        _ => None,
+    }
+}
+
+/// Pulls "HH:MM" out of an ISO-8601 timestamp like `2026-05-04T20:30:25.123Z`.
+fn parse_iso_hhmm(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 16 && bytes[10] == b'T' {
+        Some(s[11..16].to_string())
+    } else {
+        None
+    }
+}
+
 fn translate(msg: Message) -> Vec<Event> {
     let nick = match &msg.prefix {
         Some(Prefix::Nickname(n, _, _)) => n.clone(),
         Some(Prefix::ServerName(s)) => s.clone(),
         None => "*".into(),
     };
+    let meta = extract_meta(&msg.tags);
     match msg.command {
         Command::PRIVMSG(target, body) => {
             if let Some(action) = unwrap_ctcp_action(&body) {
-                vec![Event::Action { target, nick, body: strip_irc_formatting(&action) }]
+                vec![Event::Action {
+                    target,
+                    nick,
+                    body: strip_irc_formatting(&action),
+                    meta,
+                }]
             } else if is_ctcp_wrapped(&body) {
                 // Other CTCP queries (VERSION, PING, TIME, etc.) — auto-handled
                 // by the irc crate, suppress the raw echo from the chat view.
                 vec![]
             } else {
-                vec![Event::Privmsg { target, nick, body: strip_irc_formatting(&body) }]
+                vec![Event::Privmsg {
+                    target,
+                    nick,
+                    body: strip_irc_formatting(&body),
+                    meta,
+                }]
             }
         }
-        Command::JOIN(channel, _, _) => vec![Event::UserJoined { channel, nick }],
-        Command::PART(channel, _) => vec![Event::UserLeft { channel, nick }],
-        Command::NICK(new) => vec![Event::NickChanged { old: nick, new }],
+        Command::JOIN(channel, _, _) => vec![Event::UserJoined { channel, nick, meta }],
+        Command::PART(channel, _) => vec![Event::UserLeft { channel, nick, meta }],
+        Command::NICK(new) => vec![Event::NickChanged { old: nick, new, meta }],
         Command::TOPIC(channel, Some(topic)) => {
             vec![Event::Topic { channel, topic: strip_irc_formatting(&topic) }]
         }
+        Command::INVITE(invited, channel) => {
+            // With invite-notify, the server forwards INVITEs to channel ops;
+            // surface them to &status so we know who got pulled in.
+            vec![Event::Notice {
+                from: "*".into(),
+                text: format!("{nick} invited {invited} to {channel}"),
+                meta,
+            }]
+        }
         Command::NOTICE(_, text) => match unwrap_ctcp_reply(&text) {
             Some((query, args)) => vec![Event::CtcpReply { from: nick, query, args }],
-            None => vec![Event::Notice { from: nick, text: strip_irc_formatting(&text) }],
+            None => vec![Event::Notice {
+                from: nick,
+                text: strip_irc_formatting(&text),
+                meta,
+            }],
         },
         Command::Response(code, args) => match code {
             Response::RPL_NAMREPLY if args.len() >= 4 => {
