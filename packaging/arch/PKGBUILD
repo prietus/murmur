@@ -1,6 +1,6 @@
 # Maintainer: Carlos Prieto <cprieto.ortiz@gmail.com>
 pkgname=murmur
-pkgver=0.1.6
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='A native, opinionated IRC client. Subtle by default. IRCv3-ready.'
 arch=('x86_64' 'aarch64')

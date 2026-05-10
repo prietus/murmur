@@ -8,8 +8,13 @@ use irc::proto::message::Tag;
 
 use crate::config::{AuthMode, NetworkConfig};
 
-const WANT_EXTRA_CAPS: &[&str] =
-    &["message-tags", "server-time", "batch", "invite-notify"];
+const WANT_EXTRA_CAPS: &[&str] = &[
+    "message-tags",
+    "server-time",
+    "batch",
+    "invite-notify",
+    "draft/chathistory",
+];
 
 /// Per-message metadata extracted from IRCv3 tags.
 #[derive(Clone, Default, Debug)]
@@ -20,6 +25,9 @@ pub struct MsgMeta {
     pub msgid: Option<String>,
     /// Batch reference tag if this message belongs to an open batch.
     pub batch: Option<String>,
+    /// Lower-case batch kind (e.g. "chathistory", "netsplit") looked up
+    /// from the open-batch table when the message was processed.
+    pub batch_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +44,9 @@ pub enum Outgoing {
     Join(String),
     Part { channel: String, reason: Option<String> },
     Nick(String),
+    /// Fetch the most recent `limit` messages for `target`. Sent as
+    /// `CHATHISTORY LATEST <target> * <limit>`.
+    ChatHistoryLatest { target: String, limit: u32 },
 }
 
 #[derive(Clone)]
@@ -43,6 +54,8 @@ pub enum Outgoing {
 pub enum Event {
     Ready(mpsc::Sender<Outgoing>),
     Connected,
+    /// Caps the server actually ACKed during negotiation. Lowercase names.
+    CapsAcked(Vec<String>),
     ConnectError(String),
     Disconnected,
     Privmsg { target: String, nick: String, body: String, meta: MsgMeta },
@@ -58,6 +71,7 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthPhase {
+    AwaitingCapLs,
     AwaitingCapAck,
     AwaitingChallenge,
     AwaitingResult,
@@ -66,6 +80,11 @@ enum AuthPhase {
 
 #[derive(Debug, Default)]
 struct CapState {
+    /// Caps the server announced via CAP LS (key = cap name, value = optional value).
+    available: HashSet<String>,
+    /// Whether we've seen the final (non-multiline) CAP LS response.
+    ls_complete: bool,
+    /// Caps the server actually ACKed for this session.
     acked: HashSet<String>,
 }
 
@@ -113,24 +132,20 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
             }
         };
 
-        // Always pause registration and request our wanted caps.
-        // SASL piggybacks on the same REQ when needed.
-        let mut wanted: Vec<String> =
-            WANT_EXTRA_CAPS.iter().map(|s| s.to_string()).collect();
-        if use_sasl {
-            wanted.push("sasl".to_string());
-        }
-        let req_str = wanted.join(" ");
+        // Pause registration with CAP LS 302 (some bouncers — soju — NAK
+        // any REQ that arrives before LS). Once we see the final LS line
+        // we'll build the REQ from the intersection of `wanted` and what
+        // the server actually advertised.
         if let Err(e) = sender.send(Command::CAP(
             None,
-            CapSubCommand::REQ,
+            CapSubCommand::LS,
             None,
-            Some(req_str),
+            Some("302".to_string()),
         )) {
             let _ = out.send(Event::ConnectError(e.to_string())).await;
             return;
         }
-        let mut auth_phase = AuthPhase::AwaitingCapAck;
+        let mut auth_phase = AuthPhase::AwaitingCapLs;
         let mut cap_state = CapState::default();
         let mut batches: HashMap<String, BatchInfo> = HashMap::new();
 
@@ -166,9 +181,15 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                         return;
                                     }
                                     auth_phase = AuthPhase::Done;
+                                    let acked: Vec<String> =
+                                        cap_state.acked.iter().cloned().collect();
+                                    let _ = out.send(Event::CapsAcked(acked)).await;
                                     let _ = out.send(Event::Connected).await;
                                 }
                                 AuthOutcome::Done => {
+                                    let acked: Vec<String> =
+                                        cap_state.acked.iter().cloned().collect();
+                                    let _ = out.send(Event::CapsAcked(acked)).await;
                                     let _ = out.send(Event::Connected).await;
                                 }
                                 AuthOutcome::Failed(reason) => {
@@ -214,7 +235,7 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                             }
                             continue;
                         }
-                        for ev in translate(msg) {
+                        for ev in translate(msg, &batches) {
                             if out.send(ev).await.is_err() {
                                 return;
                             }
@@ -251,6 +272,17 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                         Some(Outgoing::Nick(new_nick)) => {
                             let _ = sender.send(Command::NICK(new_nick));
                         }
+                        Some(Outgoing::ChatHistoryLatest { target, limit }) => {
+                            let _ = sender.send(Command::Raw(
+                                "CHATHISTORY".into(),
+                                vec![
+                                    "LATEST".into(),
+                                    target,
+                                    "*".into(),
+                                    limit.to_string(),
+                                ],
+                            ));
+                        }
                         None => {}
                     }
                 }
@@ -276,6 +308,63 @@ fn handle_auth_msg(
 ) -> AuthOutcome {
     let use_sasl = matches!(mode, AuthMode::SaslPlain | AuthMode::SaslExternal);
     match &msg.command {
+        Command::CAP(_, sub, third, fourth) if *sub == CapSubCommand::LS => {
+            if *phase != AuthPhase::AwaitingCapLs {
+                return AuthOutcome::Pending;
+            }
+            // Multi-line LS uses a literal `*` in the slot before the
+            // cap list to indicate "more lines follow". We get that as
+            // either third == Some("*") or third == None depending on
+            // how the parser slots it. Detect by the presence of '*'
+            // in `third` while `fourth` holds the list.
+            let (more, listed) = match (third.as_deref(), fourth.as_deref()) {
+                (Some("*"), Some(list)) => (true, list),
+                (Some(list), None) => (false, list),
+                (_, Some(list)) => (false, list),
+                _ => (false, ""),
+            };
+            for token in listed.split_whitespace() {
+                let name = token
+                    .split('=')
+                    .next()
+                    .unwrap_or(token)
+                    .to_ascii_lowercase();
+                caps.available.insert(name);
+            }
+            if more {
+                return AuthOutcome::Pending;
+            }
+            caps.ls_complete = true;
+
+            // Build REQ from the intersection of what we want and what
+            // the server offers. SASL piggybacks if configured.
+            let mut wanted: Vec<&str> = WANT_EXTRA_CAPS
+                .iter()
+                .copied()
+                .filter(|c| caps.available.contains(*c))
+                .collect();
+            if use_sasl {
+                if !caps.available.contains("sasl") {
+                    return AuthOutcome::Failed("server does not support SASL".into());
+                }
+                wanted.push("sasl");
+            }
+            if wanted.is_empty() {
+                // Nothing to request — close negotiation and identify.
+                return AuthOutcome::NeedIdentify;
+            }
+            let req_str = wanted.join(" ");
+            if let Err(e) = sender.send(Command::CAP(
+                None,
+                CapSubCommand::REQ,
+                None,
+                Some(req_str),
+            )) {
+                return AuthOutcome::Failed(format!("send CAP REQ: {e}"));
+            }
+            *phase = AuthPhase::AwaitingCapAck;
+            AuthOutcome::Pending
+        }
         Command::CAP(_, sub, third, fourth) if *sub == CapSubCommand::ACK => {
             if *phase != AuthPhase::AwaitingCapAck {
                 return AuthOutcome::Pending;
@@ -465,7 +554,10 @@ fn b64_encode(input: &[u8]) -> String {
     out
 }
 
-fn extract_meta(tags: &Option<Vec<Tag>>) -> MsgMeta {
+fn extract_meta(
+    tags: &Option<Vec<Tag>>,
+    batches: &HashMap<String, BatchInfo>,
+) -> MsgMeta {
     let mut m = MsgMeta::default();
     let Some(list) = tags.as_ref() else { return m };
     for Tag(k, v) in list {
@@ -476,7 +568,14 @@ fn extract_meta(tags: &Option<Vec<Tag>>) -> MsgMeta {
                 }
             }
             "msgid" => m.msgid = v.clone(),
-            "batch" => m.batch = v.clone(),
+            "batch" => {
+                m.batch = v.clone();
+                if let Some(id) = v.as_deref() {
+                    if let Some(info) = batches.get(id) {
+                        m.batch_kind = Some(info.kind.clone());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -503,13 +602,13 @@ fn parse_iso_hhmm(s: &str) -> Option<String> {
     }
 }
 
-fn translate(msg: Message) -> Vec<Event> {
+fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
     let nick = match &msg.prefix {
         Some(Prefix::Nickname(n, _, _)) => n.clone(),
         Some(Prefix::ServerName(s)) => s.clone(),
         None => "*".into(),
     };
-    let meta = extract_meta(&msg.tags);
+    let meta = extract_meta(&msg.tags, batches);
     match msg.command {
         Command::PRIVMSG(target, body) => {
             if let Some(action) = unwrap_ctcp_action(&body) {

@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub font_family: Option<String>,
     #[serde(default)]
     pub font_size_scale: Option<f32>,
+    #[serde(default)]
+    pub highlight_keywords: Vec<String>,
 }
 
 // Per-network identity + connection settings.
@@ -149,6 +151,7 @@ impl LegacyAppConfig {
             theme: self.theme,
             font_family: self.font_family,
             font_size_scale: self.font_size_scale,
+            highlight_keywords: Vec::new(),
         }
     }
 }
@@ -394,4 +397,12 @@ channels = ["#rust"]
 #
 # Font size scale — multiplier on every UI text size (range 0.5..3.0).
 # font_size_scale = 1.0
+
+# === Notifications ========================================================
+#
+# Extra keywords (besides your nick) that trigger an OS notification when
+# they appear in any channel you're not actively reading. Case-insensitive,
+# matched on word boundaries — so "rust" won't fire on "trust" or "crust".
+# Useful for tracking project names, your handle in other contexts, etc.
+# highlight_keywords = ["murmur", "iced"]
 "##;

@@ -344,6 +344,7 @@ enum Message {
     NetworkSelected(NetworkId),
     HoverNetwork(Option<NetworkId>),
     OpenUrl(String),
+    WindowFocus(bool),
 }
 
 #[derive(Clone)]
@@ -401,6 +402,7 @@ struct NetworkState {
     last_error: Option<String>,
     autoconnect_enabled: bool,
     last_selected: Option<usize>,
+    caps_acked: HashSet<String>,
 }
 
 struct App {
@@ -429,6 +431,8 @@ struct App {
     input_history: Vec<String>,
     history_cursor: Option<usize>,
     history_draft: String,
+    window_focused: bool,
+    highlight_keywords: Vec<String>,
 }
 
 struct TabState {
@@ -450,6 +454,11 @@ struct Channel {
     hover_anim: Animation<bool>,
     select_anim: Animation<bool>,
     fade_baseline: Instant,
+    has_unread: bool,
+    has_mention: bool,
+    /// Whether we've already asked the server for initial backlog
+    /// (CHATHISTORY LATEST). Set on first self-join to avoid refetching.
+    chathistory_requested: bool,
 }
 
 fn new_row_anim() -> Animation<bool> {
@@ -506,6 +515,8 @@ impl Default for App {
             input_history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
+            window_focused: true,
+            highlight_keywords: Vec::new(),
         };
 
         match config::load() {
@@ -604,6 +615,7 @@ fn build_app_from_cfg(
             last_error: None,
             autoconnect_enabled: ncfg.autoconnect,
             last_selected,
+            caps_acked: HashSet::new(),
         });
     }
 
@@ -613,13 +625,19 @@ fn build_app_from_cfg(
         .and_then(|n| n.last_selected)
         .unwrap_or(0);
 
-    let _ = cfg; // global UI prefs already applied; per-network cfgs live in `networks`
+    let highlight_keywords = cfg
+        .highlight_keywords
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     App {
         networks,
         active,
         channels,
         selected,
         theme_name,
+        highlight_keywords,
         ..base
     }
 }
@@ -636,6 +654,9 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         hover_anim: new_row_anim(),
         select_anim: new_row_anim(),
         fade_baseline: Instant::now(),
+        has_unread: false,
+        has_mention: false,
+        chathistory_requested: false,
     }
 }
 
@@ -672,12 +693,22 @@ fn chat_line_from_meta(
     meta: &irc_worker::MsgMeta,
     now: Instant,
 ) -> ChatMessage {
+    // Backlog messages (chathistory) skip the fade-in by using an
+    // inserted_at well past the fade window — otherwise opening a
+    // bouncer-backed channel would burst-animate dozens of lines.
+    let is_backlog = meta.batch_kind.as_deref() == Some("chathistory");
+    let inserted_at = if is_backlog {
+        now.checked_sub(std::time::Duration::from_millis(FADE_MS as u64 * 4))
+            .unwrap_or(now)
+    } else {
+        now
+    };
     ChatMessage {
         nick,
         body,
         time: meta.server_time_hhmm.clone().unwrap_or_else(now_hhmm),
         day: "today".into(),
-        inserted_at: now,
+        inserted_at,
         mono_secs: now.elapsed().as_secs(),
         kind,
         msgid: meta.msgid.clone(),
@@ -834,6 +865,9 @@ impl App {
             hover_anim: new_row_anim(),
             select_anim: new_row_anim(),
             fade_baseline: Instant::now(),
+            has_unread: false,
+            has_mention: false,
+            chathistory_requested: false,
         });
         self.channels.len() - 1
     }
@@ -943,7 +977,19 @@ impl App {
                 Task::none()
             }
             Message::OpenUrl(url) => {
-                open_url(&url);
+                if let Some(nick) = url.strip_prefix("dm:") {
+                    let idx = self.ensure_channel(nick);
+                    self.set_selected(idx);
+                } else {
+                    open_url(&url);
+                }
+                Task::none()
+            }
+            Message::WindowFocus(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    self.clear_active_unread();
+                }
                 Task::none()
             }
             Message::MediaFetched(fetched) => {
@@ -1779,6 +1825,12 @@ impl App {
                 self.push_status_in(network_id, system_line("connected", now));
                 Task::none()
             }
+            IrcEvent::CapsAcked(caps) => {
+                if let Some(net) = self.net_mut(network_id) {
+                    net.caps_acked = caps.into_iter().collect();
+                }
+                Task::none()
+            }
             IrcEvent::ConnectError(e) => {
                 if let Some(net) = self.net_mut(network_id) {
                     net.status = ConnStatus::Error;
@@ -1796,27 +1848,42 @@ impl App {
                 Task::none()
             }
             IrcEvent::Privmsg { target, nick, body, meta } => {
+                let is_backlog = meta.batch_kind.as_deref() == Some("chathistory");
                 let my_nick = self
                     .net(network_id)
                     .map(|n| n.cfg.nickname.clone())
                     .unwrap_or_default();
                 let is_self = nick == my_nick;
                 let is_dm = !my_nick.is_empty() && target == my_nick;
-                if !is_self {
+                let bucket = if is_dm { nick.clone() } else { target.clone() };
+                let viewing = self.is_actively_viewing(network_id, &bucket);
+                let is_highlight = is_dm || self.is_highlight(&body, &my_nick);
+                if !is_backlog && !is_self && !viewing {
                     if is_dm {
                         notify(format!("@{nick}"), body.clone());
-                    } else if mentions(&body, &my_nick) {
+                    } else if is_highlight {
                         notify(format!("{target} — {nick}"), body.clone());
                     }
                 }
-                let bucket = if is_dm { nick.clone() } else { target };
                 let idx = self.ensure_channel_in(network_id, &bucket);
-                let fetch = self.schedule_media_fetches(&body);
-                chatlog::append(
-                    &net_name,
-                    &bucket,
-                    &format!("{}  <{}> {}", chatlog::iso_now(), nick, body),
-                );
+                if !is_backlog && !is_self && !viewing {
+                    self.channels[idx].has_unread = true;
+                    if is_highlight {
+                        self.channels[idx].has_mention = true;
+                    }
+                }
+                let fetch = if is_backlog {
+                    Task::none()
+                } else {
+                    self.schedule_media_fetches(&body)
+                };
+                if !is_backlog {
+                    chatlog::append(
+                        &net_name,
+                        &bucket,
+                        &format!("{}  <{}> {}", chatlog::iso_now(), nick, body),
+                    );
+                }
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
@@ -1827,27 +1894,42 @@ impl App {
                 fetch
             }
             IrcEvent::Action { target, nick, body, meta } => {
+                let is_backlog = meta.batch_kind.as_deref() == Some("chathistory");
                 let my_nick = self
                     .net(network_id)
                     .map(|n| n.cfg.nickname.clone())
                     .unwrap_or_default();
                 let is_self = nick == my_nick;
                 let is_dm = !my_nick.is_empty() && target == my_nick;
-                if !is_self {
+                let bucket = if is_dm { nick.clone() } else { target.clone() };
+                let viewing = self.is_actively_viewing(network_id, &bucket);
+                let is_highlight = is_dm || self.is_highlight(&body, &my_nick);
+                if !is_backlog && !is_self && !viewing {
                     if is_dm {
                         notify(format!("@{nick}"), format!("{nick} {body}"));
-                    } else if mentions(&body, &my_nick) {
+                    } else if is_highlight {
                         notify(format!("{target} — {nick}"), format!("{nick} {body}"));
                     }
                 }
-                let bucket = if is_dm { nick.clone() } else { target };
                 let idx = self.ensure_channel_in(network_id, &bucket);
-                let fetch = self.schedule_media_fetches(&body);
-                chatlog::append(
-                    &net_name,
-                    &bucket,
-                    &format!("{}  * {} {}", chatlog::iso_now(), nick, body),
-                );
+                if !is_backlog && !is_self && !viewing {
+                    self.channels[idx].has_unread = true;
+                    if is_highlight {
+                        self.channels[idx].has_mention = true;
+                    }
+                }
+                let fetch = if is_backlog {
+                    Task::none()
+                } else {
+                    self.schedule_media_fetches(&body)
+                };
+                if !is_backlog {
+                    chatlog::append(
+                        &net_name,
+                        &bucket,
+                        &format!("{}  * {} {}", chatlog::iso_now(), nick, body),
+                    );
+                }
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
@@ -1899,6 +1981,13 @@ impl App {
                     self.channels[idx]
                         .messages
                         .push(joinpart_line(&format!("→ {nick} joined"), now));
+                }
+                let my_nick = self
+                    .net(network_id)
+                    .map(|n| n.cfg.nickname.clone())
+                    .unwrap_or_default();
+                if !my_nick.is_empty() && nick == my_nick {
+                    self.maybe_fetch_initial_history(network_id, idx, &channel);
                 }
                 Task::none()
             }
@@ -1976,6 +2065,59 @@ impl App {
             self.channels[i].fade_baseline = Instant::now();
         }
         self.selected = i;
+        if self.window_focused {
+            self.channels[i].has_unread = false;
+            self.channels[i].has_mention = false;
+        }
+    }
+
+    fn clear_active_unread(&mut self) {
+        if self.window_focused
+            && self.selected < self.channels.len()
+        {
+            self.channels[self.selected].has_unread = false;
+            self.channels[self.selected].has_mention = false;
+        }
+    }
+
+    fn maybe_fetch_initial_history(
+        &mut self,
+        network_id: NetworkId,
+        ch_idx: usize,
+        target: &str,
+    ) {
+        if self.channels[ch_idx].chathistory_requested {
+            return;
+        }
+        let supported = self
+            .net(network_id)
+            .is_some_and(|n| n.caps_acked.contains("draft/chathistory"));
+        if !supported {
+            return;
+        }
+        if let Some(tx) = self.net_mut(network_id).and_then(|n| n.outgoing.as_mut()) {
+            let _ = tx.try_send(Outgoing::ChatHistoryLatest {
+                target: target.to_string(),
+                limit: 50,
+            });
+            self.channels[ch_idx].chathistory_requested = true;
+        }
+    }
+
+    fn is_actively_viewing(&self, net_id: NetworkId, bucket: &str) -> bool {
+        self.window_focused
+            && self.active == Some(net_id)
+            && self
+                .channels
+                .get(self.selected)
+                .is_some_and(|c| c.network_id == net_id && c.name == bucket)
+    }
+
+    fn is_highlight(&self, body: &str, my_nick: &str) -> bool {
+        if !my_nick.is_empty() && mentions(body, my_nick) {
+            return true;
+        }
+        self.highlight_keywords.iter().any(|kw| mentions(body, kw))
     }
 
     fn sync_channel_animations(&mut self, now: Instant) {
@@ -2023,6 +2165,11 @@ impl App {
             subs.push(Subscription::run_with(key, irc_sub_for_network));
         }
         subs.push(keyboard::listen().map(Message::Key));
+        subs.push(window::events().filter_map(|(_id, ev)| match ev {
+            window::Event::Focused => Some(Message::WindowFocus(true)),
+            window::Event::Unfocused => Some(Message::WindowFocus(false)),
+            _ => None,
+        }));
         Subscription::batch(subs)
     }
 
@@ -2307,7 +2454,15 @@ impl App {
         let hover_v = ch.hover_anim.interpolate(0.0f32, 1.0f32, now);
         let select_v = ch.select_anim.interpolate(0.0f32, 1.0f32, now);
 
-        let label_color = blend(tok::text_mid(), tok::text(), hover_v.max(select_v));
+        let mention = !selected && ch.has_mention;
+        let unread = !selected && ch.has_unread;
+
+        let base_label = if mention {
+            tok::text()
+        } else {
+            tok::text_mid()
+        };
+        let label_color = blend(base_label, tok::text(), hover_v.max(select_v));
         let prefix_color = blend(tok::text_faint(), tok::text_muted(), hover_v.max(select_v));
         let row_bg = blend(
             blend(Color::TRANSPARENT, tok::bg_hover(), hover_v),
@@ -2315,7 +2470,22 @@ impl App {
             select_v,
         );
 
+        let dot_color = if mention {
+            tok::accent()
+        } else if unread {
+            Color { a: 0.45, ..tok::text_mid() }
+        } else {
+            Color::TRANSPARENT
+        };
+        let dot = container(sp(5, 5)).style(move |_| container::Style {
+            background: Some(Background::Color(dot_color)),
+            border: Border { radius: 2.5.into(), ..Default::default() },
+            ..Default::default()
+        });
+        let bold_label = selected || mention;
+
         let row_content = row![
+            container(dot).width(Length::Fixed(7.0)).align_x(iced::alignment::Horizontal::Center),
             text(prefix)
                 .size(sz(13.0))
                 .font(regular())
@@ -2323,7 +2493,7 @@ impl App {
                 .width(Length::Fixed(12.0)),
             text(truncate(&label, 18))
                 .size(sz(13.0))
-                .font(if selected { medium() } else { regular() })
+                .font(if bold_label { medium() } else { regular() })
                 .wrapping(iced::widget::text::Wrapping::None)
                 .color(label_color),
         ]
@@ -2630,74 +2800,79 @@ impl App {
         let fade = 1.0 - (1.0 - t).powi(3); // ease-out cubic
         let alpha = fade * dim_level;
 
-        let nick_color = nick_color(&m.nick);
+        let n_color = nick_color(&m.nick);
 
-        let time_el: Element<Message> = if grouped {
-            text("").size(sz(11.0)).width(TIME_W).into()
-        } else {
-            text(m.time.clone())
-                .size(sz(11.0))
-                .color(Color { a: 0.7 * alpha, ..tok::text_faint() })
-                .width(TIME_W)
-                .into()
-        };
+        // Single-block layout: time, nick and body all live as spans in
+        // one rich_text. iced wraps the block as a paragraph, so wrapped
+        // lines fall flush to the rich_text's left edge — no row, no
+        // sibling widgets, no width-variable nick desyncing the wrap.
+        // For grouped messages the time and nick spans are simply
+        // omitted, so the body of a grouped continuation also starts at
+        // flush-left and lines up with the wrapped lines of the prior
+        // message in the same group.
+        let time_color = Color { a: 0.7 * alpha, ..tok::text_faint() };
 
-        let nick_el: Element<Message> = if grouped {
-            sp(NICK_W, 0).into()
-        } else {
-            let nick_text = text(truncate(&m.nick, 12))
-                .size(sz(13.0))
-                .color(Color { a: alpha, ..nick_color })
-                .width(NICK_W)
-                .font(medium())
-                .wrapping(iced::widget::text::Wrapping::None);
-            let my_nick = self
-                .active_net()
-                .map(|n| n.cfg.nickname.as_str())
-                .unwrap_or("");
-            let clickable =
-                m.kind != MsgKind::System && !m.nick.is_empty() && m.nick != my_nick;
-            if clickable {
-                mouse_area(nick_text)
-                    .on_press(Message::StartDmWith(m.nick.clone()))
-                    .interaction(iced::mouse::Interaction::Pointer)
-                    .into()
-            } else {
-                nick_text.into()
-            }
-        };
+        let nick_short = truncate(&m.nick, 12).to_string();
 
         let (body_font, body_color) = if m.kind == MsgKind::Action {
             (italic(), tok::text_mid())
         } else {
             (regular(), tok::text())
         };
-
-        let segs = body_segments(&m.body);
         let url_color = Color { a: alpha, ..tok::accent() };
         let text_color = Color { a: alpha, ..body_color };
-        let spans: Vec<iced::widget::text::Span<String>> = segs
-            .into_iter()
-            .map(|seg| match seg {
-                BodySeg::Text(t) => iced::widget::span(t.to_string())
-                    .color(text_color)
-                    .font(body_font),
-                BodySeg::Url(u) => iced::widget::span(u.to_string())
-                    .color(url_color)
-                    .font(body_font)
-                    .underline(true)
-                    .link(u.to_string()),
-            })
-            .collect();
+
+        let my_nick = self
+            .active_net()
+            .map(|n| n.cfg.nickname.as_str())
+            .unwrap_or("");
+        let nick_clickable = !grouped
+            && m.kind != MsgKind::System
+            && !m.nick.is_empty()
+            && m.nick != my_nick;
+
+        let mut spans: Vec<iced::widget::text::Span<String>> = Vec::new();
+
+        if !grouped {
+            spans.push(
+                iced::widget::span(format!("{} ", m.time))
+                    .size(sz(11.0))
+                    .color(time_color),
+            );
+            let mut nick_span = iced::widget::span(format!("{} ", nick_short))
+                .color(Color { a: alpha, ..n_color })
+                .font(medium());
+            if nick_clickable {
+                // dm:nick links are intercepted in OpenUrl so the OS opener
+                // never sees them.
+                nick_span = nick_span.link(format!("dm:{}", m.nick));
+            }
+            spans.push(nick_span);
+        }
+
+        for seg in body_segments(&m.body) {
+            match seg {
+                BodySeg::Text(t) => spans.push(
+                    iced::widget::span(t.to_string())
+                        .color(text_color)
+                        .font(body_font),
+                ),
+                BodySeg::Url(u) => spans.push(
+                    iced::widget::span(u.to_string())
+                        .color(url_color)
+                        .font(body_font)
+                        .underline(true)
+                        .link(u.to_string()),
+                ),
+            }
+        }
+
         let body_el = iced::widget::rich_text(spans)
             .size(sz(13.0))
+            .width(Length::Fill)
             .on_link_click(Message::OpenUrl);
 
         let top_pad = if grouped { 0.0 } else { tok::S1 as f32 };
-
-        let line_row = row![time_el, nick_el, body_el]
-            .spacing(tok::S3)
-            .align_y(iced::Alignment::Start);
 
         let media_els: Vec<Element<Message>> = extract_urls(&m.body)
             .iter()
@@ -2717,16 +2892,13 @@ impl App {
             .collect();
 
         let body: Element<Message> = if media_els.is_empty() {
-            line_row.into()
+            body_el.into()
         } else {
-            let mut col = column![line_row].spacing(tok::S2);
-            let media_indent = TIME_W as f32 + NICK_W as f32 + tok::S3 as f32 * 2.0;
+            let mut col = column![body_el].spacing(tok::S2);
             for el in media_els {
-                col = col.push(
-                    row![sp(media_indent, 0), el].align_y(iced::Alignment::Start),
-                );
+                col = col.push(el);
             }
-            col.into()
+            col.width(Length::Fill).into()
         };
 
         container(body)
