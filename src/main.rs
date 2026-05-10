@@ -2802,16 +2802,15 @@ impl App {
 
         let n_color = nick_color(&m.nick);
 
-        // Single-block layout: time, nick and body all live as spans in
-        // one rich_text. iced wraps the block as a paragraph, so wrapped
-        // lines fall flush to the rich_text's left edge — no row, no
-        // sibling widgets, no width-variable nick desyncing the wrap.
-        // For grouped messages the time and nick spans are simply
-        // omitted, so the body of a grouped continuation also starts at
-        // flush-left and lines up with the wrapped lines of the prior
-        // message in the same group.
+        // Two-column layout: fixed-width timestamp on the left, rich_text
+        // with nick + body on the right. iced wraps the rich_text as a
+        // paragraph within its column, so wrapped lines fall to the
+        // rich_text's left edge — i.e. directly under the nick. The
+        // timestamp column has fixed width, so wraps line up across all
+        // messages. Grouped continuations show the timestamp for vertical
+        // alignment but skip the nick span, so their body starts at the
+        // same X as the nick of the head message in the group.
         let time_color = Color { a: 0.7 * alpha, ..tok::text_faint() };
-
         let nick_short = truncate(&m.nick, 12).to_string();
 
         let (body_font, body_color) = if m.kind == MsgKind::Action {
@@ -2831,14 +2830,16 @@ impl App {
             && !m.nick.is_empty()
             && m.nick != my_nick;
 
+        let time_el: Element<Message> = text(m.time.clone())
+            .size(sz(11.0))
+            .color(time_color)
+            .font(regular())
+            .width(TIME_W)
+            .into();
+
         let mut spans: Vec<iced::widget::text::Span<String>> = Vec::new();
 
         if !grouped {
-            spans.push(
-                iced::widget::span(format!("{} ", m.time))
-                    .size(sz(11.0))
-                    .color(time_color),
-            );
             let mut nick_span = iced::widget::span(format!("{} ", nick_short))
                 .color(Color { a: alpha, ..n_color })
                 .font(medium());
@@ -2867,7 +2868,7 @@ impl App {
             }
         }
 
-        let body_el = iced::widget::rich_text(spans)
+        let body_rich = iced::widget::rich_text(spans)
             .size(sz(13.0))
             .width(Length::Fill)
             .on_link_click(Message::OpenUrl);
@@ -2891,20 +2892,24 @@ impl App {
             })
             .collect();
 
-        let body: Element<Message> = if media_els.is_empty() {
-            body_el.into()
+        let body_col: Element<Message> = if media_els.is_empty() {
+            body_rich.into()
         } else {
-            let mut col = column![body_el].spacing(tok::S2);
+            let mut col = column![body_rich].spacing(tok::S2);
             for el in media_els {
                 col = col.push(el);
             }
             col.width(Length::Fill).into()
         };
 
-        container(body)
-            .padding(pad(top_pad, 0.0, 0.0, 0.0))
-            .width(Fill)
-            .into()
+        container(
+            row![time_el, body_col]
+                .spacing(tok::S3)
+                .align_y(iced::Alignment::Start),
+        )
+        .padding(pad(top_pad, 0.0, 0.0, 0.0))
+        .width(Fill)
+        .into()
     }
 
     fn member_pane(&self, width: f32, target: f32) -> Element<'_, Message> {
