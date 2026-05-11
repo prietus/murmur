@@ -3191,6 +3191,22 @@ async fn fetch_media(url: String) -> FetchedMedia {
             Err(_) => return FetchedMedia { url, state: MediaState::Skipped },
         };
         let meta = parse_html_meta(&html);
+        let has_og_or_twitter = meta
+            .keys()
+            .any(|k| k.starts_with("og:") || k.starts_with("twitter:"));
+
+        // Image-wrapper pages (paste sites etc.) embed an <img> but ship
+        // no OpenGraph/Twitter metadata. Promote those directly to a
+        // full image preview instead of a sparse link card.
+        if !has_og_or_twitter {
+            if let Some(img_src) = extract_first_img_src(&html) {
+                let img_url = resolve_url(&url, &img_src);
+                if let Ok((handle, w, h)) = fetch_image(&client, &img_url).await {
+                    return FetchedMedia { url, state: MediaState::Image { handle, w, h } };
+                }
+            }
+        }
+
         let title = meta
             .get("og:title")
             .or_else(|| meta.get("twitter:title"))
@@ -3233,6 +3249,21 @@ async fn fetch_media(url: String) -> FetchedMedia {
             state: MediaState::File { kind: MediaKind::Video, content_type: ct, size },
         };
     }
+
+    // Fallback: some servers (paste sites, raw endpoints) return images
+    // labelled as text/plain or application/octet-stream. If the size
+    // looks plausible, try decoding the body as an image — if it parses,
+    // render it as one.
+    let ct_unknown = ct.is_empty()
+        || ct == "application/octet-stream"
+        || ct.starts_with("text/plain");
+    let too_big = size.map_or(false, |s| s > MAX_IMAGE_BYTES);
+    if ct_unknown && !too_big {
+        if let Ok((handle, w, h)) = fetch_image(&client, &url).await {
+            return FetchedMedia { url, state: MediaState::Image { handle, w, h } };
+        }
+    }
+
     FetchedMedia { url, state: MediaState::Skipped }
 }
 
@@ -3324,6 +3355,39 @@ fn parse_html_meta(html: &str) -> std::collections::HashMap<String, String> {
         }
     }
     out
+}
+
+/// Finds the first `<img src="...">` in the document and returns the
+/// src attribute. Used as a fallback when a page has no OpenGraph
+/// metadata but embeds an image (paste sites, raw wrappers, etc.).
+fn extract_first_img_src(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("<img") {
+        let start = i + rel;
+        let after_tag = start + 4;
+        if after_tag >= bytes.len() {
+            return None;
+        }
+        let next = bytes[after_tag];
+        if !next.is_ascii_whitespace() && next != b'/' && next != b'>' {
+            i = after_tag;
+            continue;
+        }
+        let close = match lower[after_tag..].find('>') {
+            Some(p) => after_tag + p,
+            None => return None,
+        };
+        let attrs = &html[after_tag..close];
+        if let Some(src) = extract_attr(attrs, "src") {
+            if !src.is_empty() {
+                return Some(src);
+            }
+        }
+        i = close + 1;
+    }
+    None
 }
 
 /// Pulls a single attribute's quoted value from a meta-tag's attribute
