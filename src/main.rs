@@ -13,8 +13,8 @@ use futures::Stream;
 use iced::animation::{Animation, Easing};
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, image as iced_image, mouse_area, row, scrollable, stack, text,
-    text_input, Space,
+    button, checkbox, column, container, image as iced_image, mouse_area, pick_list, radio, row,
+    scrollable, slider, stack, text, text_input, Space,
 };
 use iced::ContentFit;
 use iced::{
@@ -65,6 +65,7 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/server", "switch active network: /server <name>", true),
     ("/connect", "enable autoconnect for a network: /connect <name>", true),
     ("/disconnect", "disconnect from a network (current if no name)", false),
+    ("/settings", "open the settings panel", false),
 ];
 
 fn main() -> iced::Result {
@@ -345,6 +346,25 @@ enum Message {
     HoverNetwork(Option<NetworkId>),
     OpenUrl(String),
     WindowFocus(bool),
+    SettingsClose,
+    SettingsSelectSection(SettingsSection),
+    SettingsThemeChanged(String),
+    SettingsFontFamily(String),
+    SettingsFontScale(f32),
+    SettingsKwInput(String),
+    SettingsKwAdd,
+    SettingsKwRemove(usize),
+    SettingsNetSelect(usize),
+    SettingsNetAdd,
+    SettingsNetRemove(usize),
+    SettingsNetField(NetField, String),
+    SettingsNetTls(bool),
+    SettingsNetAutoconnect(bool),
+    SettingsNetAuthMode(SettingsAuthMode),
+    SettingsNetChannelInput(String),
+    SettingsNetChannelAdd,
+    SettingsNetChannelRemove(usize),
+    SettingsSave,
 }
 
 #[derive(Clone)]
@@ -379,6 +399,36 @@ enum MediaKind {
 enum PaletteItem {
     Channel(usize),
     Command { name: &'static str, hint: &'static str, needs_args: bool },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    Appearance,
+    Notifications,
+    Networks,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetField {
+    Name,
+    Nickname,
+    Username,
+    Realname,
+    Server,
+    Port,
+    NickPassword,
+    SaslUsername,
+    SaslPassword,
+    ClientCertPath,
+    ClientCertPass,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsAuthMode {
+    None,
+    NickServ,
+    SaslPlain,
+    SaslExternal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -433,6 +483,14 @@ struct App {
     history_draft: String,
     window_focused: bool,
     highlight_keywords: Vec<String>,
+    settings_open: bool,
+    settings_draft: AppConfig,
+    settings_section: SettingsSection,
+    settings_kw_input: String,
+    settings_net_idx: usize,
+    settings_net_channel_input: String,
+    settings_save_error: Option<String>,
+    settings_save_info: Option<String>,
 }
 
 struct TabState {
@@ -517,6 +575,20 @@ impl Default for App {
             history_draft: String::new(),
             window_focused: true,
             highlight_keywords: Vec::new(),
+            settings_open: false,
+            settings_draft: AppConfig {
+                networks: Vec::new(),
+                theme: None,
+                font_family: None,
+                font_size_scale: None,
+                highlight_keywords: Vec::new(),
+            },
+            settings_section: SettingsSection::Appearance,
+            settings_kw_input: String::new(),
+            settings_net_idx: 0,
+            settings_net_channel_input: String::new(),
+            settings_save_error: None,
+            settings_save_info: None,
         };
 
         match config::load() {
@@ -1052,7 +1124,259 @@ impl App {
                 self.set_selected(new_sel.min(self.channels.len().saturating_sub(1)));
                 Task::none()
             }
+            Message::SettingsClose => {
+                self.settings_open = false;
+                Task::none()
+            }
+            Message::SettingsSelectSection(s) => {
+                self.settings_section = s;
+                self.settings_save_error = None;
+                self.settings_save_info = None;
+                Task::none()
+            }
+            Message::SettingsThemeChanged(name) => {
+                self.settings_draft.theme = Some(name.clone());
+                if let Some(p) = themes::by_name(&name) {
+                    theme::set(p);
+                    self.theme_name = name;
+                }
+                Task::none()
+            }
+            Message::SettingsFontFamily(s) => {
+                let trimmed = s.trim();
+                self.settings_draft.font_family =
+                    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+                Task::none()
+            }
+            Message::SettingsFontScale(v) => {
+                let v = v.clamp(0.5, 3.0);
+                self.settings_draft.font_size_scale = Some(v);
+                Task::none()
+            }
+            Message::SettingsKwInput(s) => {
+                self.settings_kw_input = s;
+                Task::none()
+            }
+            Message::SettingsKwAdd => {
+                let kw = self.settings_kw_input.trim().to_string();
+                if !kw.is_empty()
+                    && !self
+                        .settings_draft
+                        .highlight_keywords
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(&kw))
+                {
+                    self.settings_draft.highlight_keywords.push(kw);
+                }
+                self.settings_kw_input.clear();
+                Task::none()
+            }
+            Message::SettingsKwRemove(i) => {
+                if i < self.settings_draft.highlight_keywords.len() {
+                    self.settings_draft.highlight_keywords.remove(i);
+                }
+                Task::none()
+            }
+            Message::SettingsNetSelect(i) => {
+                if i < self.settings_draft.networks.len() {
+                    self.settings_net_idx = i;
+                    self.settings_net_channel_input.clear();
+                }
+                Task::none()
+            }
+            Message::SettingsNetAdd => {
+                self.settings_draft.networks.push(NetworkConfig {
+                    name: format!("network-{}", self.settings_draft.networks.len() + 1),
+                    nickname: String::new(),
+                    username: None,
+                    realname: None,
+                    server: String::new(),
+                    port: 6697,
+                    use_tls: true,
+                    nick_password: None,
+                    sasl_username: None,
+                    sasl_password: None,
+                    client_cert_path: None,
+                    client_cert_pass: None,
+                    channels: Vec::new(),
+                    autoconnect: true,
+                });
+                self.settings_net_idx = self.settings_draft.networks.len() - 1;
+                Task::none()
+            }
+            Message::SettingsNetRemove(i) => {
+                if i < self.settings_draft.networks.len() {
+                    self.settings_draft.networks.remove(i);
+                    if self.settings_draft.networks.is_empty() {
+                        self.settings_net_idx = 0;
+                    } else if self.settings_net_idx >= self.settings_draft.networks.len() {
+                        self.settings_net_idx = self.settings_draft.networks.len() - 1;
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsNetField(field, value) => {
+                if let Some(n) = self.settings_draft.networks.get_mut(self.settings_net_idx) {
+                    let optstr = |v: String| if v.is_empty() { None } else { Some(v) };
+                    match field {
+                        NetField::Name => n.name = value,
+                        NetField::Nickname => n.nickname = value,
+                        NetField::Username => n.username = optstr(value),
+                        NetField::Realname => n.realname = optstr(value),
+                        NetField::Server => n.server = value,
+                        NetField::Port => {
+                            if value.is_empty() {
+                                n.port = 6697;
+                            } else if let Ok(p) = value.parse::<u16>() {
+                                n.port = p;
+                            }
+                        }
+                        NetField::NickPassword => n.nick_password = Some(value),
+                        NetField::SaslUsername => n.sasl_username = optstr(value),
+                        NetField::SaslPassword => n.sasl_password = Some(value),
+                        NetField::ClientCertPath => n.client_cert_path = Some(value),
+                        NetField::ClientCertPass => n.client_cert_pass = Some(value),
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsNetTls(v) => {
+                if let Some(n) = self.settings_draft.networks.get_mut(self.settings_net_idx) {
+                    n.use_tls = v;
+                }
+                Task::none()
+            }
+            Message::SettingsNetAutoconnect(v) => {
+                if let Some(n) = self.settings_draft.networks.get_mut(self.settings_net_idx) {
+                    n.autoconnect = v;
+                }
+                Task::none()
+            }
+            Message::SettingsNetAuthMode(mode) => {
+                if let Some(n) = self.settings_draft.networks.get_mut(self.settings_net_idx) {
+                    // The four modes are mutually exclusive in our auth_mode()
+                    // resolver; clear everything, then enable the chosen one
+                    // by setting its field to an empty placeholder so the
+                    // input row appears.
+                    n.nick_password = None;
+                    n.sasl_username = None;
+                    n.sasl_password = None;
+                    n.client_cert_path = None;
+                    n.client_cert_pass = None;
+                    match mode {
+                        SettingsAuthMode::None => {}
+                        SettingsAuthMode::NickServ => {
+                            n.nick_password = Some(String::new());
+                        }
+                        SettingsAuthMode::SaslPlain => {
+                            n.sasl_password = Some(String::new());
+                        }
+                        SettingsAuthMode::SaslExternal => {
+                            n.client_cert_path = Some(String::new());
+                            n.client_cert_pass = Some(String::new());
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsNetChannelInput(s) => {
+                self.settings_net_channel_input = s;
+                Task::none()
+            }
+            Message::SettingsNetChannelAdd => {
+                let raw = self.settings_net_channel_input.trim();
+                if !raw.is_empty() {
+                    let ch = if raw.starts_with('#') || raw.starts_with('&') {
+                        raw.to_string()
+                    } else {
+                        format!("#{raw}")
+                    };
+                    if let Some(n) = self.settings_draft.networks.get_mut(self.settings_net_idx)
+                    {
+                        if !n.channels.iter().any(|c| c.eq_ignore_ascii_case(&ch)) {
+                            n.channels.push(ch);
+                        }
+                    }
+                }
+                self.settings_net_channel_input.clear();
+                Task::none()
+            }
+            Message::SettingsNetChannelRemove(i) => {
+                if let Some(n) = self.settings_draft.networks.get_mut(self.settings_net_idx) {
+                    if i < n.channels.len() {
+                        n.channels.remove(i);
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsSave => {
+                self.save_settings();
+                Task::none()
+            }
         }
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_draft = self.build_current_config();
+        self.settings_open = true;
+        self.settings_section = SettingsSection::Appearance;
+        self.settings_save_error = None;
+        self.settings_save_info = None;
+        self.settings_kw_input.clear();
+        self.settings_net_channel_input.clear();
+        if self.settings_draft.networks.is_empty() {
+            self.settings_net_idx = 0;
+        } else if self.settings_net_idx >= self.settings_draft.networks.len() {
+            self.settings_net_idx = self.settings_draft.networks.len() - 1;
+        }
+    }
+
+    fn build_current_config(&self) -> AppConfig {
+        AppConfig {
+            networks: self.networks.iter().map(|n| n.cfg.clone()).collect(),
+            theme: Some(self.theme_name.clone()),
+            font_family: USER_FONT.get().map(|s| s.to_string()),
+            font_size_scale: FONT_SCALE.get().copied(),
+            highlight_keywords: self.highlight_keywords.clone(),
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = config::config_path() else {
+            self.settings_save_error =
+                Some("could not resolve config directory".into());
+            return;
+        };
+        let toml_text = match toml::to_string_pretty(&self.settings_draft) {
+            Ok(s) => s,
+            Err(e) => {
+                self.settings_save_error = Some(format!("serialize: {e}"));
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.settings_save_error = Some(format!("create dir: {e}"));
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(&path, &toml_text) {
+            self.settings_save_error = Some(format!("write: {e}"));
+            return;
+        }
+        // Live-apply settings that don't require a restart.
+        if let Some(name) = self.settings_draft.theme.clone() {
+            if let Some(p) = themes::by_name(&name) {
+                theme::set(p);
+                self.theme_name = name;
+            }
+        }
+        self.highlight_keywords = self.settings_draft.highlight_keywords.clone();
+        self.settings_save_error = None;
+        self.settings_save_info = Some(
+            "saved · font, font scale and network changes need a restart"
+                .into(),
+        );
     }
 
     fn handle_key(&mut self, ev: keyboard::Event) -> Task<Message> {
@@ -1071,6 +1395,26 @@ impl App {
             self.palette_query.clear();
             self.palette_cursor = 0;
             return iced::widget::operation::focus(PALETTE_INPUT_ID);
+        }
+
+        // Cmd/Ctrl + , → open settings (closes if already open)
+        let is_cmd_comma = matches!(&key, keyboard::Key::Character(c) if c.as_str() == ",")
+            && (modifiers.command() || modifiers.control());
+        if is_cmd_comma {
+            if self.settings_open {
+                self.settings_open = false;
+            } else {
+                self.open_settings();
+            }
+            return Task::none();
+        }
+
+        // Esc closes settings when it's the top-most overlay.
+        if self.settings_open
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.settings_open = false;
+            return Task::none();
         }
 
         if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Tab))
@@ -1344,6 +1688,7 @@ impl App {
             "server" => self.cmd_server(rest, now),
             "connect" => self.cmd_connect(rest, now),
             "disconnect" => self.cmd_disconnect(rest, now),
+            "settings" => { self.open_settings(); }
             other => {
                 self.channels[self.selected]
                     .messages
@@ -1866,7 +2211,11 @@ impl App {
                     }
                 }
                 let idx = self.ensure_channel_in(network_id, &bucket);
-                if !is_backlog && !is_self && !viewing {
+                // Mark unread/mention even for chathistory backlog: soju
+                // replays missed-while-disconnected messages this way, and
+                // those are still unread from the user's perspective. The
+                // !viewing check keeps the currently-selected channel quiet.
+                if !is_self && !viewing {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
@@ -1912,7 +2261,7 @@ impl App {
                     }
                 }
                 let idx = self.ensure_channel_in(network_id, &bucket);
-                if !is_backlog && !is_self && !viewing {
+                if !is_self && !viewing {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
@@ -2170,6 +2519,7 @@ impl App {
             window::Event::Unfocused => Some(Message::WindowFocus(false)),
             _ => None,
         }));
+
         Subscription::batch(subs)
     }
 
@@ -2224,7 +2574,11 @@ impl App {
 
         let main: Element<Message> = row(panes).spacing(0).height(Fill).into();
 
-        if self.palette_open {
+        // Overlay stack: settings goes on top of palette so Cmd+, while
+        // palette is open lands the user on settings without losing state.
+        if self.settings_open {
+            stack![main, self.settings_overlay()].into()
+        } else if self.palette_open {
             stack![main, self.palette_overlay()].into()
         } else {
             main
@@ -2232,9 +2586,7 @@ impl App {
     }
 
     fn palette_overlay(&self) -> Element<'_, Message> {
-        let mut items = self.filtered_palette_items();
-        items.truncate(PALETTE_MAX_ITEMS);
-        let visible = items;
+        let items = self.filtered_palette_items();
 
         let input = text_input("type to search, or /command …", &self.palette_query)
             .id(PALETTE_INPUT_ID)
@@ -2244,7 +2596,7 @@ impl App {
             .size(sz(14.0))
             .style(palette_input_style);
 
-        let rows: Vec<Element<Message>> = visible
+        let rows: Vec<Element<Message>> = items
             .into_iter()
             .enumerate()
             .map(|(i, item)| self.palette_row(i, item))
@@ -2263,7 +2615,13 @@ impl App {
             .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
             .into()
         } else {
-            column(rows).spacing(1).into()
+            // Scrollable so command/channel lists longer than the
+            // viewport stay reachable with mouse wheel. Arrow keys still
+            // move the cursor through every item; auto-scroll to the
+            // highlighted row is a separate refinement.
+            scrollable(column(rows).spacing(1))
+                .height(Length::Fixed(PALETTE_MAX_ITEMS as f32 * 34.0))
+                .into()
         };
 
         let divider = container(sp(Fill, 1)).style(|_| container::Style {
@@ -2307,6 +2665,586 @@ impl App {
             .padding(pad(90.0, 0.0, 0.0, 0.0));
 
         stack![backdrop, centered].into()
+    }
+
+    fn settings_overlay(&self) -> Element<'_, Message> {
+        let header_label = text("settings")
+            .size(sz(13.0))
+            .font(medium())
+            .color(tok::text());
+        let close_btn = button(
+            text("×")
+                .size(sz(16.0))
+                .color(tok::text_muted())
+                .font(medium()),
+        )
+        .padding(pad(0.0, tok::S3, 0.0, tok::S3))
+        .style(|_, status| ghost_btn_style(status))
+        .on_press(Message::SettingsClose);
+        let header = container(
+            row![header_label, sp(Fill, 0), close_btn]
+                .align_y(iced::Alignment::Center)
+                .spacing(tok::S3),
+        )
+        .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
+        .width(Fill);
+
+        let header_divider = container(sp(Fill, 1)).style(|_| container::Style {
+            background: Some(Background::Color(tok::border_soft())),
+            ..Default::default()
+        });
+
+        let nav = column![
+            self.settings_section_button("Appearance", SettingsSection::Appearance),
+            self.settings_section_button("Notifications", SettingsSection::Notifications),
+            self.settings_section_button("Networks", SettingsSection::Networks),
+        ]
+        .spacing(tok::S1)
+        .width(Length::Fixed(150.0));
+
+        let section: Element<Message> = match self.settings_section {
+            SettingsSection::Appearance => self.settings_appearance_section(),
+            SettingsSection::Notifications => self.settings_notifications_section(),
+            SettingsSection::Networks => self.settings_networks_section(),
+        };
+        let section_scroll = scrollable(
+            container(section)
+                .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
+                .width(Fill),
+        )
+        .height(Fill);
+
+        let body = row![
+            container(nav)
+                .padding(pad(tok::S3, tok::S3, tok::S3, tok::S3))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(tok::bg_0())),
+                    ..Default::default()
+                })
+                .height(Fill),
+            container(sp(1, Fill)).style(|_| container::Style {
+                background: Some(Background::Color(tok::border_soft())),
+                ..Default::default()
+            }),
+            section_scroll,
+        ]
+        .height(Length::Fixed(440.0));
+
+        let footer_divider = container(sp(Fill, 1)).style(|_| container::Style {
+            background: Some(Background::Color(tok::border_soft())),
+            ..Default::default()
+        });
+        let status_label: Element<Message> =
+            if let Some(err) = self.settings_save_error.as_deref() {
+                text(err.to_string())
+                    .size(sz(11.0))
+                    .color(Color { a: 1.0, ..tok::accent() })
+                    .into()
+            } else if let Some(info) = self.settings_save_info.as_deref() {
+                text(info.to_string())
+                    .size(sz(11.0))
+                    .color(tok::text_muted())
+                    .into()
+            } else {
+                sp(0, 0).into()
+            };
+        let save_btn = button(
+            text("Save")
+                .size(sz(12.0))
+                .font(medium())
+                .color(Color::WHITE),
+        )
+        .padding(pad(tok::S2 as f32, tok::S4, tok::S2 as f32, tok::S4))
+        .style(|_, status| primary_btn_style(status))
+        .on_press(Message::SettingsSave);
+        let cancel_btn = button(
+            text("Close")
+                .size(sz(12.0))
+                .font(medium())
+                .color(tok::text_mid()),
+        )
+        .padding(pad(tok::S2 as f32, tok::S4, tok::S2 as f32, tok::S4))
+        .style(|_, status| ghost_btn_style(status))
+        .on_press(Message::SettingsClose);
+        let footer = container(
+            row![status_label, sp(Fill, 0), cancel_btn, save_btn]
+                .spacing(tok::S2)
+                .align_y(iced::Alignment::Center),
+        )
+        .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
+        .width(Fill);
+
+        let modal = container(
+            column![header, header_divider, body, footer_divider, footer].spacing(0),
+        )
+        .width(Length::Fixed(720.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(tok::bg_1())),
+            border: Border {
+                color: tok::border(),
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            shadow: Shadow {
+                color: Color { a: 0.45, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 12.0),
+                blur_radius: 40.0,
+            },
+            ..Default::default()
+        })
+        .clip(true);
+
+        let backdrop = mouse_area(
+            container(Space::new().width(Fill).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color { a: 0.45, ..Color::BLACK })),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::SettingsClose);
+
+        let centered = container(modal)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .padding(pad(60.0, 0.0, 0.0, 0.0));
+
+        stack![backdrop, centered].into()
+    }
+
+    fn settings_section_button(
+        &self,
+        label: &'static str,
+        section: SettingsSection,
+    ) -> Element<'_, Message> {
+        let selected = self.settings_section == section;
+        let label_color = if selected { tok::text() } else { tok::text_muted() };
+        let content = row![text(label)
+            .size(sz(12.0))
+            .font(medium())
+            .color(label_color),]
+        .align_y(iced::Alignment::Center)
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3));
+        button(content)
+            .on_press(Message::SettingsSelectSection(section))
+            .width(Fill)
+            .padding(0)
+            .style(move |_, status| section_btn_style(selected, status))
+            .into()
+    }
+
+    fn settings_appearance_section(&self) -> Element<'_, Message> {
+        let theme_names: Vec<String> =
+            themes::ALL.iter().map(|(n, _)| (*n).to_string()).collect();
+        let current_theme = self
+            .settings_draft
+            .theme
+            .clone()
+            .unwrap_or_else(|| "soft-dark".to_string());
+        let theme_picker = pick_list(theme_names, Some(current_theme), |s: String| {
+            Message::SettingsThemeChanged(s)
+        })
+        .text_size(sz(12.0))
+        .width(Length::Fixed(220.0));
+
+        let font_family_value = self
+            .settings_draft
+            .font_family
+            .clone()
+            .unwrap_or_default();
+        let font_input = text_input("e.g. JetBrains Mono (empty = bundled)", &font_family_value)
+            .on_input(Message::SettingsFontFamily)
+            .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+            .size(sz(12.0))
+            .width(Length::Fixed(320.0))
+            .style(|_, status| input_style(status));
+
+        let scale_value = self.settings_draft.font_size_scale.unwrap_or(1.0);
+        let scale_slider = slider(0.5..=3.0, scale_value, Message::SettingsFontScale).step(0.05);
+        let scale_label = text(format!("{scale_value:.2}×"))
+            .size(sz(11.0))
+            .color(tok::text_mid())
+            .width(Length::Fixed(54.0));
+        let scale_row = row![
+            container(scale_slider).width(Length::Fixed(266.0)),
+            scale_label
+        ]
+        .spacing(tok::S3)
+        .align_y(iced::Alignment::Center);
+
+        let note = text("Theme applies instantly. Font family and font scale need a restart.")
+            .size(sz(10.0))
+            .color(tok::text_faint());
+
+        column![
+            settings_section_header("Appearance"),
+            settings_row("Theme", theme_picker.into()),
+            settings_row("Font family", font_input.into()),
+            settings_row("Font scale", scale_row.into()),
+            sp(0, tok::S2),
+            note,
+        ]
+        .spacing(tok::S3)
+        .into()
+    }
+
+    fn settings_notifications_section(&self) -> Element<'_, Message> {
+        let chips: Vec<Element<Message>> = self
+            .settings_draft
+            .highlight_keywords
+            .iter()
+            .enumerate()
+            .map(|(i, kw)| chip(kw, Message::SettingsKwRemove(i)))
+            .collect();
+        let chip_row: Element<Message> = if chips.is_empty() {
+            text("no keywords yet — your own nick is always a highlight")
+                .size(sz(11.0))
+                .color(tok::text_faint())
+                .into()
+        } else {
+            wrap_row(chips, tok::S2 as f32)
+        };
+
+        let input = text_input("add a keyword and press Enter", &self.settings_kw_input)
+            .on_input(Message::SettingsKwInput)
+            .on_submit(Message::SettingsKwAdd)
+            .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+            .size(sz(12.0))
+            .width(Length::Fixed(300.0))
+            .style(|_, status| input_style(status));
+        let add_btn = button(
+            text("+")
+                .size(sz(14.0))
+                .font(medium())
+                .color(tok::text_mid()),
+        )
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .style(|_, status| ghost_btn_style(status))
+        .on_press(Message::SettingsKwAdd);
+
+        let note = text(
+            "Words that, when they appear in any channel you're not actively reading, \
+trigger an OS notification and mark the channel as a mention. Case-insensitive, \
+matched on word boundaries.",
+        )
+        .size(sz(10.0))
+        .color(tok::text_faint());
+
+        column![
+            settings_section_header("Notifications"),
+            text("Highlight keywords")
+                .size(sz(11.0))
+                .font(medium())
+                .color(tok::text_mid()),
+            chip_row,
+            row![input, add_btn]
+                .spacing(tok::S2)
+                .align_y(iced::Alignment::Center),
+            sp(0, tok::S2),
+            note,
+        ]
+        .spacing(tok::S3)
+        .into()
+    }
+
+    fn settings_networks_section(&self) -> Element<'_, Message> {
+        let list_items: Vec<Element<Message>> = self
+            .settings_draft
+            .networks
+            .iter()
+            .enumerate()
+            .map(|(i, n)| self.settings_network_list_row(i, &n.name))
+            .collect();
+        let list_col = if list_items.is_empty() {
+            column![text("no networks defined")
+                .size(sz(11.0))
+                .color(tok::text_faint())]
+        } else {
+            column(list_items).spacing(2)
+        };
+
+        let add_btn = button(
+            text("+ add network")
+                .size(sz(11.0))
+                .font(medium())
+                .color(tok::text_mid()),
+        )
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .width(Fill)
+        .style(|_, status| ghost_btn_style(status))
+        .on_press(Message::SettingsNetAdd);
+
+        let left = column![
+            list_col,
+            sp(0, tok::S2),
+            add_btn,
+        ]
+        .spacing(tok::S2)
+        .width(Length::Fixed(170.0));
+
+        let form: Element<Message> = if let Some(net) =
+            self.settings_draft.networks.get(self.settings_net_idx)
+        {
+            self.settings_network_form(self.settings_net_idx, net)
+        } else {
+            text("Add a network to start editing.")
+                .size(sz(11.0))
+                .color(tok::text_faint())
+                .into()
+        };
+
+        column![
+            settings_section_header("Networks"),
+            row![
+                container(left).width(Length::Fixed(170.0)),
+                container(sp(1, Fill)).style(|_| container::Style {
+                    background: Some(Background::Color(tok::border_soft())),
+                    ..Default::default()
+                }),
+                container(form).padding(pad(0.0, 0.0, 0.0, tok::S3)).width(Fill),
+            ]
+            .spacing(tok::S3),
+            sp(0, tok::S2),
+            text("Network changes apply on the next restart.")
+                .size(sz(10.0))
+                .color(tok::text_faint()),
+        ]
+        .spacing(tok::S3)
+        .into()
+    }
+
+    fn settings_network_list_row(&self, i: usize, name: &str) -> Element<'_, Message> {
+        let selected = i == self.settings_net_idx;
+        let label_color = if selected { tok::text() } else { tok::text_muted() };
+        button(
+            text(truncate(name, 16))
+                .size(sz(11.0))
+                .font(medium())
+                .color(label_color),
+        )
+        .on_press(Message::SettingsNetSelect(i))
+        .width(Fill)
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .style(move |_, status| section_btn_style(selected, status))
+        .into()
+    }
+
+    fn settings_network_form(
+        &self,
+        idx: usize,
+        n: &NetworkConfig,
+    ) -> Element<'_, Message> {
+        let mode = match n.auth_mode() {
+            config::AuthMode::None => SettingsAuthMode::None,
+            config::AuthMode::NickServ => SettingsAuthMode::NickServ,
+            config::AuthMode::SaslPlain => SettingsAuthMode::SaslPlain,
+            config::AuthMode::SaslExternal => SettingsAuthMode::SaslExternal,
+        };
+
+        let radios: Vec<Element<Message>> = vec![
+            radio("None", SettingsAuthMode::None, Some(mode), Message::SettingsNetAuthMode)
+                .text_size(sz(11.0))
+                .size(14.0)
+                .into(),
+            radio(
+                "NickServ",
+                SettingsAuthMode::NickServ,
+                Some(mode),
+                Message::SettingsNetAuthMode,
+            )
+            .text_size(sz(11.0))
+            .size(14.0)
+            .into(),
+            radio(
+                "SASL PLAIN",
+                SettingsAuthMode::SaslPlain,
+                Some(mode),
+                Message::SettingsNetAuthMode,
+            )
+            .text_size(sz(11.0))
+            .size(14.0)
+            .into(),
+            radio(
+                "SASL EXTERNAL",
+                SettingsAuthMode::SaslExternal,
+                Some(mode),
+                Message::SettingsNetAuthMode,
+            )
+            .text_size(sz(11.0))
+            .size(14.0)
+            .into(),
+        ];
+        let auth_row: Element<Message> = row(radios)
+            .spacing(tok::S3)
+            .align_y(iced::Alignment::Center)
+            .into();
+
+        let auth_fields: Element<Message> = match mode {
+            SettingsAuthMode::None => sp(0, 0).into(),
+            SettingsAuthMode::NickServ => column![settings_row(
+                "Nick password",
+                settings_password_input(
+                    "your NickServ password",
+                    n.nick_password.clone().unwrap_or_default(),
+                    NetField::NickPassword,
+                ),
+            )]
+            .into(),
+            SettingsAuthMode::SaslPlain => column![
+                settings_row(
+                    "SASL user",
+                    settings_text_input(
+                        "default: your nickname",
+                        n.sasl_username.clone().unwrap_or_default(),
+                        NetField::SaslUsername,
+                    ),
+                ),
+                settings_row(
+                    "SASL password",
+                    settings_password_input(
+                        "your SASL password",
+                        n.sasl_password.clone().unwrap_or_default(),
+                        NetField::SaslPassword,
+                    ),
+                ),
+            ]
+            .spacing(tok::S2)
+            .into(),
+            SettingsAuthMode::SaslExternal => column![
+                settings_row(
+                    "Client cert (.p12)",
+                    settings_text_input(
+                        "/absolute/path/to/client.p12",
+                        n.client_cert_path.clone().unwrap_or_default(),
+                        NetField::ClientCertPath,
+                    ),
+                ),
+                settings_row(
+                    "Cert passphrase",
+                    settings_password_input(
+                        "non-empty on macOS",
+                        n.client_cert_pass.clone().unwrap_or_default(),
+                        NetField::ClientCertPass,
+                    ),
+                ),
+            ]
+            .spacing(tok::S2)
+            .into(),
+        };
+
+        let tls_box: Element<Message> = checkbox(n.use_tls)
+            .label("TLS")
+            .on_toggle(Message::SettingsNetTls)
+            .text_size(sz(11.0))
+            .size(14.0)
+            .into();
+        let auto_box: Element<Message> = checkbox(n.autoconnect)
+            .label("Autoconnect on startup")
+            .on_toggle(Message::SettingsNetAutoconnect)
+            .text_size(sz(11.0))
+            .size(14.0)
+            .into();
+
+        let channel_chips: Vec<Element<Message>> = n
+            .channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| chip(ch, Message::SettingsNetChannelRemove(i)))
+            .collect();
+        let channel_row: Element<Message> = if channel_chips.is_empty() {
+            text("no auto-join channels")
+                .size(sz(11.0))
+                .color(tok::text_faint())
+                .into()
+        } else {
+            wrap_row(channel_chips, tok::S2 as f32)
+        };
+
+        let channel_input = text_input("#channel", &self.settings_net_channel_input)
+            .on_input(Message::SettingsNetChannelInput)
+            .on_submit(Message::SettingsNetChannelAdd)
+            .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+            .size(sz(11.0))
+            .width(Length::Fixed(180.0))
+            .style(|_, status| input_style(status));
+        let channel_add_btn = button(
+            text("+")
+                .size(sz(14.0))
+                .font(medium())
+                .color(tok::text_mid()),
+        )
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .style(|_, status| ghost_btn_style(status))
+        .on_press(Message::SettingsNetChannelAdd);
+
+        let remove_btn = button(
+            text("Remove this network")
+                .size(sz(11.0))
+                .color(Color { a: 1.0, ..tok::accent() }),
+        )
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .style(|_, status| ghost_btn_style(status))
+        .on_press(Message::SettingsNetRemove(idx));
+
+        column![
+            settings_row(
+                "Name",
+                settings_text_input("displayed in sidebar", n.name.clone(), NetField::Name),
+            ),
+            settings_row(
+                "Nickname",
+                settings_text_input("your IRC nick", n.nickname.clone(), NetField::Nickname),
+            ),
+            settings_row(
+                "Username",
+                settings_text_input(
+                    "default: same as nick",
+                    n.username.clone().unwrap_or_default(),
+                    NetField::Username,
+                ),
+            ),
+            settings_row(
+                "Realname",
+                settings_text_input(
+                    "default: same as nick",
+                    n.realname.clone().unwrap_or_default(),
+                    NetField::Realname,
+                ),
+            ),
+            settings_row(
+                "Server",
+                settings_text_input("irc.example.org", n.server.clone(), NetField::Server),
+            ),
+            settings_row(
+                "Port",
+                settings_text_input("6697", n.port.to_string(), NetField::Port),
+            ),
+            settings_row("Transport", tls_box),
+            sp(0, tok::S1),
+            text("Authentication")
+                .size(sz(11.0))
+                .font(medium())
+                .color(tok::text_mid()),
+            auth_row,
+            auth_fields,
+            sp(0, tok::S1),
+            text("Auto-join channels")
+                .size(sz(11.0))
+                .font(medium())
+                .color(tok::text_mid()),
+            channel_row,
+            row![channel_input, channel_add_btn]
+                .spacing(tok::S2)
+                .align_y(iced::Alignment::Center),
+            sp(0, tok::S1),
+            auto_box,
+            sp(0, tok::S2),
+            remove_btn,
+        ]
+        .spacing(tok::S2)
+        .into()
     }
 
     fn palette_row(&self, i: usize, item: PaletteItem) -> Element<'_, Message> {
@@ -3829,6 +4767,157 @@ fn member_row_style(status: button::Status) -> button::Style {
         background: Some(Background::Color(bg)),
         text_color: tok::text(),
         border: Border { radius: 5.0.into(), ..Default::default() },
+        shadow: Shadow::default(),
+        ..Default::default()
+    }
+}
+
+fn settings_section_header(label: &str) -> Element<'_, Message> {
+    text(label.to_string())
+        .size(sz(14.0))
+        .font(medium())
+        .color(tok::text())
+        .into()
+}
+
+fn settings_row<'a>(
+    label: &'a str,
+    control: Element<'a, Message>,
+) -> Element<'a, Message> {
+    row![
+        container(
+            text(label.to_string())
+                .size(sz(11.0))
+                .font(medium())
+                .color(tok::text_mid())
+        )
+        .width(Length::Fixed(130.0))
+        .padding(pad(tok::S2 as f32, 0.0, 0.0, 0.0)),
+        control,
+    ]
+    .spacing(tok::S3)
+    .align_y(iced::Alignment::Start)
+    .into()
+}
+
+fn settings_text_input<'a>(
+    placeholder: &'a str,
+    value: String,
+    field: NetField,
+) -> Element<'a, Message> {
+    text_input(placeholder, &value)
+        .on_input(move |v| Message::SettingsNetField(field, v))
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .size(sz(11.0))
+        .width(Length::Fixed(320.0))
+        .style(|_, status| input_style(status))
+        .into()
+}
+
+fn settings_password_input<'a>(
+    placeholder: &'a str,
+    value: String,
+    field: NetField,
+) -> Element<'a, Message> {
+    text_input(placeholder, &value)
+        .on_input(move |v| Message::SettingsNetField(field, v))
+        .secure(true)
+        .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+        .size(sz(11.0))
+        .width(Length::Fixed(320.0))
+        .style(|_, status| input_style(status))
+        .into()
+}
+
+fn chip<'a>(label: &str, on_remove: Message) -> Element<'a, Message> {
+    let inner = row![
+        text(label.to_string())
+            .size(sz(11.0))
+            .color(tok::text())
+            .font(regular()),
+        button(text("×").size(sz(11.0)).color(tok::text_faint()))
+            .padding(pad(0.0, 4.0, 0.0, 4.0))
+            .style(|_, status| ghost_btn_style(status))
+            .on_press(on_remove),
+    ]
+    .spacing(tok::S1)
+    .align_y(iced::Alignment::Center);
+    container(inner)
+        .padding(pad(2.0, tok::S2, 2.0, tok::S3))
+        .style(|_| container::Style {
+            background: Some(Background::Color(tok::bg_2())),
+            border: Border {
+                color: tok::border_soft(),
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+// Builds a flowing list of chips by stacking horizontal rows that each
+// hold up to a fixed count. Cheap-and-cheerful wrap since iced 0.14 has
+// no native wrap container.
+fn wrap_row<'a>(items: Vec<Element<'a, Message>>, _gap: f32) -> Element<'a, Message> {
+    const PER_ROW: usize = 5;
+    let mut rows_v: Vec<Element<'a, Message>> = Vec::new();
+    let mut current: Vec<Element<'a, Message>> = Vec::with_capacity(PER_ROW);
+    for el in items {
+        current.push(el);
+        if current.len() >= PER_ROW {
+            let taken = std::mem::take(&mut current);
+            rows_v.push(row(taken).spacing(tok::S2).into());
+        }
+    }
+    if !current.is_empty() {
+        rows_v.push(row(current).spacing(tok::S2).into());
+    }
+    column(rows_v).spacing(tok::S2).into()
+}
+
+fn primary_btn_style(status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => tok::accent(),
+        button::Status::Pressed => tok::accent_ring(),
+        _ => tok::accent(),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: Color::WHITE,
+        border: Border { radius: 6.0.into(), ..Default::default() },
+        shadow: Shadow::default(),
+        ..Default::default()
+    }
+}
+
+fn ghost_btn_style(status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => tok::bg_hover(),
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: tok::text(),
+        border: Border { radius: 6.0.into(), ..Default::default() },
+        shadow: Shadow::default(),
+        ..Default::default()
+    }
+}
+
+fn section_btn_style(selected: bool, status: button::Status) -> button::Style {
+    let bg = if selected {
+        tok::bg_hover()
+    } else {
+        match status {
+            button::Status::Hovered => tok::bg_hover(),
+            _ => Color::TRANSPARENT,
+        }
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: tok::text(),
+        border: Border { radius: 6.0.into(), ..Default::default() },
         shadow: Shadow::default(),
         ..Default::default()
     }
