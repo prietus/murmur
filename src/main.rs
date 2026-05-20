@@ -66,6 +66,7 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/connect", "enable autoconnect for a network: /connect <name>", true),
     ("/disconnect", "disconnect from a network (current if no name)", false),
     ("/settings", "open the settings panel", false),
+    ("/close", "close current buffer (DM/channel) — alias /wc, /q", false),
 ];
 
 fn main() -> iced::Result {
@@ -1409,6 +1410,16 @@ impl App {
             return Task::none();
         }
 
+        // Cmd/Ctrl + W → close current buffer
+        let is_cmd_w = matches!(&key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("w"))
+            && (modifiers.command() || modifiers.control())
+            && !self.palette_open
+            && !self.settings_open;
+        if is_cmd_w {
+            self.cmd_close(Instant::now());
+            return Task::none();
+        }
+
         // Esc closes settings when it's the top-most overlay.
         if self.settings_open
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
@@ -1689,6 +1700,7 @@ impl App {
             "connect" => self.cmd_connect(rest, now),
             "disconnect" => self.cmd_disconnect(rest, now),
             "settings" => { self.open_settings(); }
+            "close" | "wc" | "q" => self.cmd_close(now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -1761,6 +1773,29 @@ impl App {
         }
         let reason = if rest.is_empty() { None } else { Some(rest.to_string()) };
         self.send_out(Outgoing::Part { channel, reason }, now);
+    }
+
+    fn cmd_close(&mut self, now: Instant) {
+        let i = self.selected;
+        if i >= self.channels.len() {
+            return;
+        }
+        let name = self.channels[i].name.clone();
+        if name.starts_with('&') {
+            self.channels[i]
+                .messages
+                .push(system_line("can't close the status buffer", now));
+            return;
+        }
+        if name.starts_with('#') {
+            let cid = self.channels[i].network_id;
+            if let Some(tx) = self.net_mut(cid).and_then(|n| n.outgoing.as_mut()) {
+                let _ = tx.try_send(Outgoing::Part { channel: name, reason: None });
+            }
+        }
+        self.channels.remove(i);
+        let new_sel = if i > 0 { i - 1 } else { 0 };
+        self.set_selected(new_sel.min(self.channels.len().saturating_sub(1)));
     }
 
     fn cmd_nick(&mut self, rest: &str, now: Instant) {
