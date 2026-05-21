@@ -47,6 +47,14 @@ pub enum Outgoing {
     /// Fetch the most recent `limit` messages for `target`. Sent as
     /// `CHATHISTORY LATEST <target> * <limit>`.
     ChatHistoryLatest { target: String, limit: u32 },
+    /// `WHOIS <nick>`. Replies arrive as numerics (311/312/317/318/319/330/671).
+    Whois(String),
+    /// `AWAY :<msg>` to set, `AWAY` (no arg) to clear.
+    Away(Option<String>),
+    /// `TOPIC <channel> :<topic>` to set; `topic = None` queries.
+    Topic { channel: String, topic: Option<String> },
+    /// Raw IRC line. `cmd` and `args` already parsed.
+    Raw { cmd: String, args: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -282,6 +290,18 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                     limit.to_string(),
                                 ],
                             ));
+                        }
+                        Some(Outgoing::Whois(target)) => {
+                            let _ = sender.send(Command::WHOIS(None, target));
+                        }
+                        Some(Outgoing::Away(msg)) => {
+                            let _ = sender.send(Command::AWAY(msg));
+                        }
+                        Some(Outgoing::Topic { channel, topic }) => {
+                            let _ = sender.send(Command::TOPIC(channel, topic));
+                        }
+                        Some(Outgoing::Raw { cmd, args }) => {
+                            let _ = sender.send(Command::Raw(cmd, args));
                         }
                         None => {}
                     }
@@ -670,9 +690,90 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
                     topic: strip_irc_formatting(&args[2]),
                 }]
             }
-            _ => vec![],
+            _ => format_numeric(code, &args)
+                .map(|text| vec![Event::Notice { from: "*".into(), text, meta }])
+                .unwrap_or_default(),
         },
+        // Numerics not in irc-proto's Response enum (330 RPL_WHOISACCOUNT,
+        // 338 RPL_WHOISACTUALLY, 671 RPL_WHOISSECURE, etc.) arrive here as
+        // Raw("<code>", args).
+        Command::Raw(ref cmd, ref args) => {
+            if let Ok(n) = cmd.parse::<u16>() {
+                if let Some(text) = format_extended_numeric(n, args) {
+                    return vec![Event::Notice { from: "*".into(), text, meta }];
+                }
+            }
+            vec![]
+        }
         _ => vec![],
+    }
+}
+
+// Format a known numeric reply into a one-line summary for the status buffer.
+// Returns None for numerics we don't surface (everything not enumerated below).
+// Args layout follows: args[0] = our nick (client target), args[1..] = payload.
+fn format_numeric(code: Response, args: &[String]) -> Option<String> {
+    let p = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
+    match code {
+        Response::RPL_AWAY if args.len() >= 3 => {
+            Some(format!("{} is away: {}", p(1), p(2)))
+        }
+        Response::RPL_UNAWAY => Some("you are no longer marked as away".into()),
+        Response::RPL_NOWAWAY => Some("you have been marked as away".into()),
+        Response::RPL_WHOISUSER if args.len() >= 6 => Some(format!(
+            "whois {}: {}!{}@{} — {}",
+            p(1), p(1), p(2), p(3), p(5)
+        )),
+        Response::RPL_WHOISSERVER if args.len() >= 4 => {
+            Some(format!("whois {}: server {} ({})", p(1), p(2), p(3)))
+        }
+        Response::RPL_WHOISOPERATOR if args.len() >= 3 => {
+            Some(format!("whois {}: {}", p(1), p(2)))
+        }
+        Response::RPL_WHOISIDLE if args.len() >= 4 => {
+            Some(format!("whois {}: idle {}s, signon {}", p(1), p(2), p(3)))
+        }
+        Response::RPL_WHOISCHANNELS if args.len() >= 3 => {
+            Some(format!("whois {}: channels {}", p(1), p(2)))
+        }
+        Response::RPL_ENDOFWHOIS if args.len() >= 2 => {
+            Some(format!("whois {}: end", p(1)))
+        }
+        Response::RPL_WHOISCERTFP if args.len() >= 3 => {
+            Some(format!("whois {}: {}", p(1), p(2)))
+        }
+        Response::ERR_NOSUCHNICK if args.len() >= 3 => {
+            Some(format!("no such nick: {}", p(1)))
+        }
+        Response::ERR_NOSUCHCHANNEL if args.len() >= 3 => {
+            Some(format!("no such channel: {}", p(1)))
+        }
+        Response::ERR_CHANOPRIVSNEEDED if args.len() >= 3 => {
+            Some(format!("not channel operator: {}", p(1)))
+        }
+        _ => None,
+    }
+}
+
+// Format numeric codes that irc-proto doesn't enumerate.
+fn format_extended_numeric(code: u16, args: &[String]) -> Option<String> {
+    let p = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
+    match code {
+        // 330 RPL_WHOISACCOUNT: <client> <nick> <account> :is logged in as
+        330 if args.len() >= 4 => Some(format!("whois {}: account {}", p(1), p(2))),
+        // 338 RPL_WHOISACTUALLY: <client> <nick> [...] :Actual host info
+        338 if args.len() >= 3 => Some(format!(
+            "whois {}: {}",
+            p(1),
+            args[2..].join(" ")
+        )),
+        // 671 RPL_WHOISSECURE: <client> <nick> :is using a secure connection
+        671 if args.len() >= 3 => Some(format!("whois {}: {}", p(1), p(2))),
+        // 378 RPL_WHOISHOST: <client> <nick> :is connecting from ...
+        378 if args.len() >= 3 => Some(format!("whois {}: {}", p(1), p(2))),
+        // 379 RPL_WHOISMODES: <client> <nick> :is using modes ...
+        379 if args.len() >= 3 => Some(format!("whois {}: {}", p(1), p(2))),
+        _ => None,
     }
 }
 

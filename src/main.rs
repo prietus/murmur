@@ -67,6 +67,15 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/disconnect", "disconnect from a network (current if no name)", false),
     ("/settings", "open the settings panel", false),
     ("/close", "close current buffer (DM/channel) — alias /wc, /q", false),
+    ("/ignore", "hide all messages from a nick (persisted) — no args to list", false),
+    ("/unignore", "remove a nick from the ignore list", true),
+    ("/ignores", "list ignored nicks", false),
+    ("/away", "set away with optional reason — /back to clear", false),
+    ("/back", "clear away status", false),
+    ("/whois", "WHOIS a nick — reply in the status buffer (alias /wi)", true),
+    ("/topic", "show or set the current channel's topic", false),
+    ("/clear", "clear messages in the current buffer (logs unaffected)", false),
+    ("/raw", "send a raw IRC line — alias /quote", true),
 ];
 
 fn main() -> iced::Result {
@@ -470,6 +479,7 @@ struct App {
     fallback_status: ConnStatus,
     last_error: Option<String>,
     dimmed_nicks: HashSet<String>,
+    ignored_nicks: HashSet<String>,
     palette_open: bool,
     palette_query: String,
     palette_cursor: usize,
@@ -562,6 +572,7 @@ impl Default for App {
             fallback_status: ConnStatus::NotConfigured,
             last_error: None,
             dimmed_nicks: HashSet::new(),
+            ignored_nicks: HashSet::new(),
             palette_open: false,
             palette_query: String::new(),
             palette_cursor: 0,
@@ -583,6 +594,7 @@ impl Default for App {
                 font_family: None,
                 font_size_scale: None,
                 highlight_keywords: Vec::new(),
+                ignored_nicks: Vec::new(),
             },
             settings_section: SettingsSection::Appearance,
             settings_kw_input: String::new(),
@@ -704,6 +716,12 @@ fn build_app_from_cfg(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let ignored_nicks = cfg
+        .ignored_nicks
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
     App {
         networks,
         active,
@@ -711,6 +729,7 @@ fn build_app_from_cfg(
         selected,
         theme_name,
         highlight_keywords,
+        ignored_nicks,
         ..base
     }
 }
@@ -731,6 +750,34 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         has_mention: false,
         chathistory_requested: false,
     }
+}
+
+// Tokenize an IRC line into (command, args). A leading `:` on a token
+// marks the trailing parameter (rest of line is one arg).
+fn parse_raw_line(line: &str) -> (String, Vec<String>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut rest = line.trim();
+    while !rest.is_empty() {
+        if let Some(trailing) = rest.strip_prefix(':') {
+            parts.push(trailing.to_string());
+            break;
+        }
+        match rest.find(char::is_whitespace) {
+            Some(idx) => {
+                parts.push(rest[..idx].to_string());
+                rest = rest[idx..].trim_start();
+            }
+            None => {
+                parts.push(rest.to_string());
+                break;
+            }
+        }
+    }
+    if parts.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let cmd = parts.remove(0).to_uppercase();
+    (cmd, parts)
 }
 
 fn system_line(body: &str, now: Instant) -> ChatMessage {
@@ -1333,12 +1380,15 @@ impl App {
     }
 
     fn build_current_config(&self) -> AppConfig {
+        let mut ignored: Vec<String> = self.ignored_nicks.iter().cloned().collect();
+        ignored.sort();
         AppConfig {
             networks: self.networks.iter().map(|n| n.cfg.clone()).collect(),
             theme: Some(self.theme_name.clone()),
             font_family: USER_FONT.get().map(|s| s.to_string()),
             font_size_scale: FONT_SCALE.get().copied(),
             highlight_keywords: self.highlight_keywords.clone(),
+            ignored_nicks: ignored,
         }
     }
 
@@ -1348,6 +1398,12 @@ impl App {
                 Some("could not resolve config directory".into());
             return;
         };
+        // The settings panel doesn't expose ignored_nicks — merge the
+        // live set so /ignore changes made while settings was open are
+        // not silently wiped on save.
+        let mut ignored: Vec<String> = self.ignored_nicks.iter().cloned().collect();
+        ignored.sort();
+        self.settings_draft.ignored_nicks = ignored;
         let toml_text = match toml::to_string_pretty(&self.settings_draft) {
             Ok(s) => s,
             Err(e) => {
@@ -1701,6 +1757,15 @@ impl App {
             "disconnect" => self.cmd_disconnect(rest, now),
             "settings" => { self.open_settings(); }
             "close" | "wc" | "q" => self.cmd_close(now),
+            "ignore" => self.cmd_ignore(rest, now),
+            "unignore" => self.cmd_unignore(rest, now),
+            "ignores" => self.cmd_ignores(now),
+            "away" => self.cmd_away(rest, now),
+            "back" => self.cmd_back(now),
+            "whois" | "wi" => self.cmd_whois(rest, now),
+            "topic" => self.cmd_topic(rest, now),
+            "clear" => self.cmd_clear(now),
+            "raw" | "quote" => self.cmd_raw(rest, now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -1773,6 +1838,173 @@ impl App {
         }
         let reason = if rest.is_empty() { None } else { Some(rest.to_string()) };
         self.send_out(Outgoing::Part { channel, reason }, now);
+    }
+
+    // Write the current in-memory state back to config.toml. Used by
+    // commands that mutate persisted prefs (/ignore, /unignore).
+    fn persist_config(&self) -> Result<(), String> {
+        let path = config::config_path()
+            .ok_or_else(|| "could not resolve config directory".to_string())?;
+        let cfg = self.build_current_config();
+        let text = toml::to_string_pretty(&cfg)
+            .map_err(|e| format!("serialize: {e}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir: {e}"))?;
+        }
+        std::fs::write(&path, text).map_err(|e| format!("write: {e}"))
+    }
+
+    fn cmd_ignore(&mut self, rest: &str, now: Instant) {
+        let nick = rest.split_whitespace().next().unwrap_or("");
+        if nick.is_empty() {
+            let mut listed: Vec<String> = self.ignored_nicks.iter().cloned().collect();
+            listed.sort();
+            let body = if listed.is_empty() {
+                "no nicks ignored".to_string()
+            } else {
+                format!("ignored ({}): {}", listed.len(), listed.join(", "))
+            };
+            self.channels[self.selected].messages.push(system_line(&body, now));
+            return;
+        }
+        let key = nick.to_ascii_lowercase();
+        if !self.ignored_nicks.insert(key) {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("already ignoring {nick}"), now));
+            return;
+        }
+        let msg = match self.persist_config() {
+            Ok(()) => format!("ignoring {nick}"),
+            Err(e) => format!("ignoring {nick} (persist failed: {e})"),
+        };
+        self.channels[self.selected].messages.push(system_line(&msg, now));
+    }
+
+    fn cmd_unignore(&mut self, rest: &str, now: Instant) {
+        let nick = rest.split_whitespace().next().unwrap_or("");
+        if nick.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /unignore <nick>", now));
+            return;
+        }
+        let key = nick.to_ascii_lowercase();
+        if !self.ignored_nicks.remove(&key) {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("{nick} was not ignored"), now));
+            return;
+        }
+        let msg = match self.persist_config() {
+            Ok(()) => format!("no longer ignoring {nick}"),
+            Err(e) => format!("unignored {nick} (persist failed: {e})"),
+        };
+        self.channels[self.selected].messages.push(system_line(&msg, now));
+    }
+
+    fn cmd_ignores(&mut self, now: Instant) {
+        let mut listed: Vec<String> = self.ignored_nicks.iter().cloned().collect();
+        listed.sort();
+        let body = if listed.is_empty() {
+            "no nicks ignored".to_string()
+        } else {
+            format!("ignored ({}): {}", listed.len(), listed.join(", "))
+        };
+        self.channels[self.selected].messages.push(system_line(&body, now));
+    }
+
+    fn cmd_away(&mut self, rest: &str, now: Instant) {
+        let reason = rest.trim();
+        let msg = if reason.is_empty() {
+            Some("away".to_string())
+        } else {
+            Some(reason.to_string())
+        };
+        if !self.send_out(Outgoing::Away(msg.clone()), now) {
+            return;
+        }
+        let body = format!("away set: {}", msg.as_deref().unwrap_or("away"));
+        self.channels[self.selected].messages.push(system_line(&body, now));
+    }
+
+    fn cmd_back(&mut self, now: Instant) {
+        if !self.send_out(Outgoing::Away(None), now) {
+            return;
+        }
+        self.channels[self.selected]
+            .messages
+            .push(system_line("back — away cleared", now));
+    }
+
+    fn cmd_whois(&mut self, rest: &str, now: Instant) {
+        let target = rest.split_whitespace().next().unwrap_or("");
+        if target.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /whois <nick>", now));
+            return;
+        }
+        self.send_out(Outgoing::Whois(target.to_string()), now);
+    }
+
+    fn cmd_topic(&mut self, rest: &str, now: Instant) {
+        let channel = self.channels[self.selected].name.clone();
+        if !channel.starts_with('#') && !channel.starts_with('&') {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("not a channel — /topic is channel-only", now));
+            return;
+        }
+        if channel.starts_with('&') {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("can't /topic the status buffer", now));
+            return;
+        }
+        if rest.trim().is_empty() {
+            let body = match self.channels[self.selected].topic.clone() {
+                Some(t) if !t.is_empty() => format!("topic for {channel}: {t}"),
+                _ => format!("no topic set for {channel}"),
+            };
+            self.channels[self.selected].messages.push(system_line(&body, now));
+            return;
+        }
+        let topic = rest.to_string();
+        self.send_out(
+            Outgoing::Topic { channel, topic: Some(topic) },
+            now,
+        );
+    }
+
+    fn cmd_clear(&mut self, _now: Instant) {
+        if self.selected < self.channels.len() {
+            self.channels[self.selected].messages.clear();
+        }
+    }
+
+    fn cmd_raw(&mut self, rest: &str, now: Instant) {
+        let line = rest.trim();
+        if line.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /raw <IRC line>", now));
+            return;
+        }
+        let (cmd, args) = parse_raw_line(line);
+        if cmd.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("invalid raw line", now));
+            return;
+        }
+        if !self.send_out(Outgoing::Raw { cmd: cmd.clone(), args }, now) {
+            return;
+        }
+        self.channels[self.selected]
+            .messages
+            .push(system_line(&format!("→ {cmd}"), now));
     }
 
     fn cmd_close(&mut self, now: Instant) {
@@ -2228,6 +2460,9 @@ impl App {
                 Task::none()
             }
             IrcEvent::Privmsg { target, nick, body, meta } => {
+                if self.is_ignored(&nick) {
+                    return Task::none();
+                }
                 let is_backlog = meta.batch_kind.as_deref() == Some("chathistory");
                 let my_nick = self
                     .net(network_id)
@@ -2278,6 +2513,9 @@ impl App {
                 fetch
             }
             IrcEvent::Action { target, nick, body, meta } => {
+                if self.is_ignored(&nick) {
+                    return Task::none();
+                }
                 let is_backlog = meta.batch_kind.as_deref() == Some("chathistory");
                 let my_nick = self
                     .net(network_id)
@@ -2410,6 +2648,9 @@ impl App {
                 Task::none()
             }
             IrcEvent::Notice { from, text, meta: _ } => {
+                if from != "*" && self.is_ignored(&from) {
+                    return Task::none();
+                }
                 self.push_status_in(network_id, system_line(&format!("-{from}- {text}"), now));
                 Task::none()
             }
@@ -2495,6 +2736,10 @@ impl App {
                 .channels
                 .get(self.selected)
                 .is_some_and(|c| c.network_id == net_id && c.name == bucket)
+    }
+
+    fn is_ignored(&self, nick: &str) -> bool {
+        !nick.is_empty() && self.ignored_nicks.contains(&nick.to_ascii_lowercase())
     }
 
     fn is_highlight(&self, body: &str, my_nick: &str) -> bool {

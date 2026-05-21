@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub font_size_scale: Option<f32>,
     #[serde(default)]
     pub highlight_keywords: Vec<String>,
+    #[serde(default)]
+    pub ignored_nicks: Vec<String>,
 }
 
 // Per-network identity + connection settings.
@@ -152,6 +154,7 @@ impl LegacyAppConfig {
             font_family: self.font_family,
             font_size_scale: self.font_size_scale,
             highlight_keywords: Vec::new(),
+            ignored_nicks: Vec::new(),
         }
     }
 }
@@ -405,4 +408,11 @@ channels = ["#rust"]
 # matched on word boundaries — so "rust" won't fire on "trust" or "crust".
 # Useful for tracking project names, your handle in other contexts, etc.
 # highlight_keywords = ["murmur", "iced"]
+
+# === Ignore list (global) ==================================================
+#
+# Nicks listed here are hidden completely (channel messages and DMs). Case-
+# insensitive. Manage live in-app with /ignore <nick>, /unignore <nick>,
+# /ignores to list. Changes persist back to this file.
+# ignored_nicks = ["spammer42"]
 "##;
