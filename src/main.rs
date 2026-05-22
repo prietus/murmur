@@ -78,6 +78,15 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/topic", "show or set the current channel's topic", false),
     ("/clear", "clear messages in the current buffer (logs unaffected)", false),
     ("/raw", "send a raw IRC line — alias /quote", true),
+    ("/kick", "kick a user from the current channel: /kick <nick> [reason]", true),
+    ("/mode", "set or query modes: /mode <target> [<modes> [args]]", true),
+    ("/op", "grant operator (+o) to one or more nicks on current channel", true),
+    ("/deop", "remove operator (-o) from one or more nicks", true),
+    ("/voice", "grant voice (+v) to one or more nicks", true),
+    ("/devoice", "remove voice (-v) from one or more nicks", true),
+    ("/ban", "ban a nick or mask on the current channel (+b)", true),
+    ("/unban", "lift a ban (-b) on the current channel", true),
+    ("/invite", "invite a nick to a channel: /invite <nick> [#chan]", true),
 ];
 
 fn main() -> iced::Result {
@@ -1768,6 +1777,15 @@ impl App {
             "topic" => self.cmd_topic(rest, now),
             "clear" => self.cmd_clear(now),
             "raw" | "quote" => self.cmd_raw(rest, now),
+            "kick" => self.cmd_kick(rest, now),
+            "mode" => self.cmd_mode(rest, now),
+            "op" => self.cmd_channel_priv("+", "o", rest, now),
+            "deop" => self.cmd_channel_priv("-", "o", rest, now),
+            "voice" => self.cmd_channel_priv("+", "v", rest, now),
+            "devoice" => self.cmd_channel_priv("-", "v", rest, now),
+            "ban" => self.cmd_ban(true, rest, now),
+            "unban" => self.cmd_ban(false, rest, now),
+            "invite" => self.cmd_invite(rest, now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -2007,6 +2025,142 @@ impl App {
         self.channels[self.selected]
             .messages
             .push(system_line(&format!("→ {cmd}"), now));
+    }
+
+    fn current_channel_for_op(&mut self, cmd: &str, now: Instant) -> Option<String> {
+        let name = self.channels[self.selected].name.clone();
+        if name.starts_with('&') {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("/{cmd} only works inside a channel"), now));
+            return None;
+        }
+        if !name.starts_with('#') {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("/{cmd} only works inside a channel"), now));
+            return None;
+        }
+        Some(name)
+    }
+
+    fn cmd_kick(&mut self, rest: &str, now: Instant) {
+        let Some(channel) = self.current_channel_for_op("kick", now) else { return };
+        let (nick, reason) = match rest.split_once(char::is_whitespace) {
+            Some((n, r)) => {
+                let r = r.trim();
+                (n.to_string(), if r.is_empty() { None } else { Some(r.to_string()) })
+            }
+            None => (rest.trim().to_string(), None),
+        };
+        if nick.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /kick <nick> [reason]", now));
+            return;
+        }
+        self.send_out(Outgoing::Kick { channel, nick, reason }, now);
+    }
+
+    fn cmd_mode(&mut self, rest: &str, now: Instant) {
+        let mut parts = rest.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        if first.is_empty() {
+            // No args — show mode of the current channel if we're in one.
+            if let Some(channel) = self
+                .channels
+                .get(self.selected)
+                .map(|c| c.name.clone())
+                .filter(|n| n.starts_with('#'))
+            {
+                self.send_out(
+                    Outgoing::Mode { target: channel, modes: String::new(), args: vec![] },
+                    now,
+                );
+                return;
+            }
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /mode <target> [<modes> [args...]]", now));
+            return;
+        }
+        let target = first.to_string();
+        let modes = parts.next().unwrap_or("").to_string();
+        let args: Vec<String> = parts.map(str::to_string).collect();
+        self.send_out(Outgoing::Mode { target, modes, args }, now);
+    }
+
+    // Bulk MODE +o/-o/+v/-v helper. Chunks nicks in groups of 4 to respect
+    // the smallest common MODES= limit advertised by IRCds.
+    fn cmd_channel_priv(&mut self, sign: &str, flag: &str, rest: &str, now: Instant) {
+        let label = format!("{sign}{flag}");
+        let Some(channel) = self.current_channel_for_op(&label, now) else { return };
+        let nicks: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+        if nicks.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("usage: /{label} <nick> [nick...]"), now));
+            return;
+        }
+        for chunk in nicks.chunks(4) {
+            let modes = format!("{sign}{}", flag.repeat(chunk.len()));
+            let args: Vec<String> = chunk.to_vec();
+            if !self.send_out(
+                Outgoing::Mode { target: channel.clone(), modes, args },
+                now,
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn cmd_ban(&mut self, ban: bool, rest: &str, now: Instant) {
+        let label = if ban { "ban" } else { "unban" };
+        let Some(channel) = self.current_channel_for_op(label, now) else { return };
+        let target = rest.split_whitespace().next().unwrap_or("");
+        if target.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line(&format!("usage: /{label} <nick|mask>"), now));
+            return;
+        }
+        // Bare nick → nick!*@*; preserve full masks as-is.
+        let mask = if target.contains('!') || target.contains('@') {
+            target.to_string()
+        } else {
+            format!("{target}!*@*")
+        };
+        let modes = if ban { "+b" } else { "-b" }.to_string();
+        self.send_out(
+            Outgoing::Mode { target: channel, modes, args: vec![mask] },
+            now,
+        );
+    }
+
+    fn cmd_invite(&mut self, rest: &str, now: Instant) {
+        let mut parts = rest.split_whitespace();
+        let nick = parts.next().unwrap_or("").to_string();
+        if nick.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /invite <nick> [#channel]", now));
+            return;
+        }
+        let channel = match parts.next() {
+            Some(c) => c.to_string(),
+            None => {
+                let name = self.channels[self.selected].name.clone();
+                if !name.starts_with('#') {
+                    self.channels[self.selected].messages.push(system_line(
+                        "usage: /invite <nick> <#channel> (no channel context here)",
+                        now,
+                    ));
+                    return;
+                }
+                name
+            }
+        };
+        self.send_out(Outgoing::Invite { nick, channel }, now);
     }
 
     fn cmd_close(&mut self, now: Instant) {

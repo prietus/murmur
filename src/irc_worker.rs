@@ -55,6 +55,13 @@ pub enum Outgoing {
     Topic { channel: String, topic: Option<String> },
     /// Raw IRC line. `cmd` and `args` already parsed.
     Raw { cmd: String, args: Vec<String> },
+    /// `KICK <channel> <nick> [:reason]`.
+    Kick { channel: String, nick: String, reason: Option<String> },
+    /// `INVITE <nick> <channel>`.
+    Invite { nick: String, channel: String },
+    /// `MODE <target> <modes> [args...]`. Sent raw to avoid the typed
+    /// `Mode<ChannelMode>` parsing in `irc-proto`.
+    Mode { target: String, modes: String, args: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -302,6 +309,19 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                         }
                         Some(Outgoing::Raw { cmd, args }) => {
                             let _ = sender.send(Command::Raw(cmd, args));
+                        }
+                        Some(Outgoing::Kick { channel, nick, reason }) => {
+                            let _ = sender.send(Command::KICK(channel, nick, reason));
+                        }
+                        Some(Outgoing::Invite { nick, channel }) => {
+                            let _ = sender.send(Command::INVITE(nick, channel));
+                        }
+                        Some(Outgoing::Mode { target, modes, args }) => {
+                            let mut argv = Vec::with_capacity(2 + args.len());
+                            argv.push(target);
+                            argv.push(modes);
+                            argv.extend(args);
+                            let _ = sender.send(Command::Raw("MODE".into(), argv));
                         }
                         None => {}
                     }
@@ -666,6 +686,34 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
                 meta,
             }]
         }
+        Command::KICK(channel, target, reason) => {
+            let text = match reason {
+                Some(r) if !r.is_empty() => {
+                    format!("{nick} kicked {target} from {channel} ({r})")
+                }
+                _ => format!("{nick} kicked {target} from {channel}"),
+            };
+            vec![
+                Event::UserLeft { channel, nick: target, meta: meta.clone() },
+                Event::Notice { from: "*".into(), text, meta },
+            ]
+        }
+        Command::ChannelMODE(channel, modes) => {
+            let rendered = render_modes(&modes);
+            vec![Event::Notice {
+                from: "*".into(),
+                text: format!("{nick} sets mode {channel} {rendered}"),
+                meta,
+            }]
+        }
+        Command::UserMODE(target, modes) => {
+            let rendered = render_modes(&modes);
+            vec![Event::Notice {
+                from: "*".into(),
+                text: format!("{nick} sets mode {target} {rendered}"),
+                meta,
+            }]
+        }
         Command::NOTICE(_, text) => match unwrap_ctcp_reply(&text) {
             Some((query, args)) => vec![Event::CtcpReply { from: nick, query, args }],
             None => vec![Event::Notice {
@@ -712,6 +760,18 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
 // Format a known numeric reply into a one-line summary for the status buffer.
 // Returns None for numerics we don't surface (everything not enumerated below).
 // Args layout follows: args[0] = our nick (client target), args[1..] = payload.
+// Pretty-print a vector of Mode entries as "+o nick -v other" etc.
+fn render_modes<T>(modes: &[irc::proto::Mode<T>]) -> String
+where
+    T: irc::proto::mode::ModeType,
+{
+    modes
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn format_numeric(code: Response, args: &[String]) -> Option<String> {
     let p = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
     match code {
@@ -750,6 +810,44 @@ fn format_numeric(code: Response, args: &[String]) -> Option<String> {
         }
         Response::ERR_CHANOPRIVSNEEDED if args.len() >= 3 => {
             Some(format!("not channel operator: {}", p(1)))
+        }
+        // Operator command numerics.
+        Response::RPL_INVITING if args.len() >= 3 => {
+            Some(format!("inviting {} to {}", p(1), p(2)))
+        }
+        Response::RPL_CHANNELMODEIS if args.len() >= 3 => Some(format!(
+            "mode {}: {}",
+            p(1),
+            args[2..].join(" ")
+        )),
+        Response::RPL_BANLIST if args.len() >= 3 => Some(format!(
+            "banlist {}: {}",
+            p(1),
+            args[2..].join(" ")
+        )),
+        Response::RPL_ENDOFBANLIST if args.len() >= 2 => {
+            Some(format!("banlist {}: end", p(1)))
+        }
+        Response::ERR_USERNOTINCHANNEL if args.len() >= 4 => {
+            Some(format!("{} is not on {}", p(1), p(2)))
+        }
+        Response::ERR_NOTONCHANNEL if args.len() >= 3 => {
+            Some(format!("you are not on {}", p(1)))
+        }
+        Response::ERR_USERONCHANNEL if args.len() >= 4 => {
+            Some(format!("{} is already on {}", p(1), p(2)))
+        }
+        Response::ERR_NEEDMOREPARAMS if args.len() >= 3 => {
+            Some(format!("{} needs more parameters", p(1)))
+        }
+        Response::ERR_UNKNOWNMODE if args.len() >= 3 => {
+            Some(format!("unknown mode char: {}", p(1)))
+        }
+        Response::ERR_INVITEONLYCHAN if args.len() >= 3 => {
+            Some(format!("cannot join {}: invite-only", p(1)))
+        }
+        Response::ERR_NOPRIVILEGES => {
+            Some("permission denied: server operator required".into())
         }
         _ => None,
     }
