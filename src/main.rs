@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
+mod emoji;
 mod irc_worker;
 
 use std::collections::{HashMap, HashSet};
@@ -47,8 +48,10 @@ const MEMBERS_MAX_W: f32 = 200.0;
 
 const PALETTE_INPUT_ID: &str = "palette-input";
 const COMPOSE_INPUT_ID: &str = "compose-input";
+const EMOJI_PICKER_INPUT_ID: &str = "emoji-picker-input";
 const PALETTE_W: f32 = 520.0;
 const PALETTE_MAX_ITEMS: usize = 8;
+const EMOJI_CELL: u32 = 34;
 
 const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/dimm", "focus mode, or soft-ignore a nick", false),
@@ -389,6 +392,11 @@ enum Message {
     SettingsNetChannelAdd,
     SettingsNetChannelRemove(usize),
     SettingsSave,
+    EmojiPickerToggle,
+    EmojiPickerClose,
+    EmojiPickerQuery(String),
+    EmojiPickerCategory(emoji::Category),
+    EmojiInsert(&'static str),
 }
 
 #[derive(Clone)]
@@ -530,6 +538,13 @@ struct App {
     typing_sent: HashMap<(NetworkId, String), Instant>,
     /// Per-target server-side read marker (timestamp last reported by MARKREAD).
     read_markers: HashMap<(NetworkId, String), String>,
+    emoji_picker: Option<EmojiPickerState>,
+}
+
+#[derive(Default)]
+struct EmojiPickerState {
+    query: String,
+    category: Option<emoji::Category>,
 }
 
 struct TabState {
@@ -646,6 +661,7 @@ impl Default for App {
             typing_observed: HashMap::new(),
             typing_sent: HashMap::new(),
             read_markers: HashMap::new(),
+            emoji_picker: None,
         };
 
         match config::load() {
@@ -830,6 +846,36 @@ fn parse_raw_line(line: &str) -> (String, Vec<String>) {
 
 // Render a horizontal strip of reaction badges below a message:
 // each badge shows `<emoji> <count>` with a tinted background.
+fn emoji_cell(entry: &'static emoji::Entry) -> Element<'static, Message> {
+    mouse_area(
+        button(
+            container(text(entry.ch).size(sz(18.0)))
+                .width(Length::Fixed(EMOJI_CELL as f32))
+                .height(Length::Fixed(EMOJI_CELL as f32))
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+        )
+        .on_press(Message::EmojiInsert(entry.ch))
+        .padding(0)
+        .style(|_theme, status| {
+            let bg = match status {
+                button::Status::Hovered => tok::bg_hover(),
+                button::Status::Pressed => tok::bg_2(),
+                _ => Color::TRANSPARENT,
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: tok::text(),
+                border: Border { radius: 6.0.into(), ..Default::default() },
+                shadow: Shadow::default(),
+                ..Default::default()
+            }
+        }),
+    )
+    .interaction(iced::mouse::Interaction::Pointer)
+    .into()
+}
+
 fn reactions_row<'a>(
     reactions: &'a HashMap<String, HashSet<String>>,
 ) -> Element<'a, Message> {
@@ -1570,6 +1616,36 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::EmojiPickerToggle => {
+                if self.emoji_picker.is_some() {
+                    self.emoji_picker = None;
+                    iced::widget::operation::focus(COMPOSE_INPUT_ID)
+                } else {
+                    self.emoji_picker = Some(EmojiPickerState::default());
+                    iced::widget::operation::focus(EMOJI_PICKER_INPUT_ID)
+                }
+            }
+            Message::EmojiPickerClose => {
+                self.emoji_picker = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::EmojiPickerQuery(q) => {
+                if let Some(p) = self.emoji_picker.as_mut() {
+                    p.query = q;
+                }
+                Task::none()
+            }
+            Message::EmojiPickerCategory(cat) => {
+                if let Some(p) = self.emoji_picker.as_mut() {
+                    p.category = if p.category == Some(cat) { None } else { Some(cat) };
+                }
+                Task::none()
+            }
+            Message::EmojiInsert(ch) => {
+                self.input.push_str(ch);
+                self.emoji_picker = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
         }
     }
 
@@ -1691,6 +1767,14 @@ impl App {
         {
             self.settings_open = false;
             return Task::none();
+        }
+
+        // Esc closes the emoji picker when it's the active overlay.
+        if self.emoji_picker.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.emoji_picker = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
         }
 
         if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Tab))
@@ -3621,6 +3705,8 @@ impl App {
             stack![main, self.settings_overlay()].into()
         } else if self.palette_open {
             stack![main, self.palette_overlay()].into()
+        } else if self.emoji_picker.is_some() {
+            stack![main, self.emoji_picker_overlay()].into()
         } else {
             main
         }
@@ -3706,6 +3792,143 @@ impl App {
             .padding(pad(90.0, 0.0, 0.0, 0.0));
 
         stack![backdrop, centered].into()
+    }
+
+    fn emoji_picker_overlay(&self) -> Element<'_, Message> {
+        let st = self.emoji_picker.as_ref().expect("emoji_picker_overlay called when picker closed");
+
+        let search = text_input("search…", &st.query)
+            .id(EMOJI_PICKER_INPUT_ID)
+            .on_input(Message::EmojiPickerQuery)
+            .size(sz(12.0))
+            .padding(pad(tok::S2, tok::S3, tok::S2, tok::S3))
+            .style(palette_input_style);
+
+        // Build the emoji grid: 8 columns of clickable buttons.
+        let entries: Vec<&'static emoji::Entry> =
+            emoji::filter(st.category, &st.query).take(400).collect();
+
+        const COLS: usize = 8;
+        let mut rows_vec: Vec<Element<Message>> = Vec::new();
+        for chunk in entries.chunks(COLS) {
+            let mut cells: Vec<Element<Message>> = Vec::with_capacity(COLS);
+            for entry in chunk {
+                cells.push(emoji_cell(entry).into());
+            }
+            // Pad incomplete row so cells stay left-aligned.
+            while cells.len() < COLS {
+                cells.push(sp(EMOJI_CELL, EMOJI_CELL).into());
+            }
+            rows_vec.push(row(cells).spacing(2).into());
+        }
+
+        let grid: Element<Message> = if entries.is_empty() {
+            container(
+                text("no matches")
+                    .size(sz(12.0))
+                    .color(tok::text_muted()),
+            )
+            .padding(pad(tok::S4, tok::S4, tok::S4, tok::S4))
+            .into()
+        } else {
+            scrollable(
+                column(rows_vec)
+                    .spacing(2)
+                    .padding(pad(tok::S2, tok::S2, tok::S2, tok::S2)),
+            )
+            .height(Length::Fixed(260.0))
+            .into()
+        };
+
+        // Category tabs at the bottom.
+        let cat_tabs: Vec<Element<Message>> = emoji::Category::ALL
+            .iter()
+            .map(|c| {
+                let selected = st.category == Some(*c);
+                let glyph = c.glyph();
+                mouse_area(
+                    button(
+                        container(text(glyph).size(sz(14.0)))
+                            .width(Length::Fixed(28.0))
+                            .height(Length::Fixed(28.0))
+                            .align_x(iced::alignment::Horizontal::Center)
+                            .align_y(iced::alignment::Vertical::Center),
+                    )
+                    .on_press(Message::EmojiPickerCategory(*c))
+                    .padding(0)
+                    .style(move |_theme, status| {
+                        let bg = if selected {
+                            tok::accent_soft()
+                        } else {
+                            match status {
+                                button::Status::Hovered => tok::bg_hover(),
+                                _ => Color::TRANSPARENT,
+                            }
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: tok::text(),
+                            border: Border { radius: 6.0.into(), ..Default::default() },
+                            shadow: Shadow::default(),
+                            ..Default::default()
+                        }
+                    }),
+                )
+                .interaction(iced::mouse::Interaction::Pointer)
+                .into()
+            })
+            .collect();
+
+        let cat_bar = container(row(cat_tabs).spacing(2).align_y(iced::Alignment::Center))
+            .padding(pad(tok::S2, tok::S3, tok::S2, tok::S3))
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_2())),
+                ..Default::default()
+            });
+
+        let divider = container(sp(Fill, 1)).style(|_| container::Style {
+            background: Some(Background::Color(tok::border_soft())),
+            ..Default::default()
+        });
+
+        let modal = container(column![search, divider, grid, cat_bar].spacing(0))
+            .width(Length::Fixed(360.0))
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_1())),
+                border: Border {
+                    color: tok::border(),
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                shadow: Shadow {
+                    color: Color { a: 0.45, ..Color::BLACK },
+                    offset: iced::Vector::new(0.0, 12.0),
+                    blur_radius: 40.0,
+                },
+                ..Default::default()
+            })
+            .clip(true);
+
+        let backdrop = mouse_area(
+            container(Space::new().width(Fill).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color { a: 0.0, ..Color::BLACK })),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::EmojiPickerClose);
+
+        // Anchor near the bottom-right (above the compose bar).
+        let anchored = container(modal)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding(pad(0.0, tok::S4 as f32 + 50.0, 60.0, 0.0));
+
+        stack![backdrop, anchored].into()
     }
 
     fn settings_overlay(&self) -> Element<'_, Message> {
@@ -4648,8 +4871,22 @@ matched on word boundaries.",
             send_btn.into()
         };
 
+        let emoji_btn = mouse_area(
+            button(
+                container(text("☺").size(sz(16.0)).color(tok::text_muted()).font(regular()))
+                    .width(Length::Fixed(36.0))
+                    .height(Length::Fixed(36.0))
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Center),
+            )
+            .on_press(Message::EmojiPickerToggle)
+            .padding(0)
+            .style(|_theme, status| ghost_button_style(status)),
+        )
+        .interaction(iced::mouse::Interaction::Pointer);
+
         let input = container(
-            row![text_field, send_btn]
+            row![text_field, emoji_btn, send_btn]
                 .spacing(tok::S2)
                 .align_y(iced::Alignment::Center),
         )
@@ -5819,6 +6056,21 @@ fn send_button_style(enabled: bool, status: button::Status) -> button::Style {
     button::Style {
         background: Some(Background::Color(bg)),
         text_color: if enabled { Color::WHITE } else { tok::text_faint() },
+        border: Border { radius: 10.0.into(), ..Default::default() },
+        shadow: Shadow::default(),
+        ..Default::default()
+    }
+}
+
+fn ghost_button_style(status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => tok::bg_hover(),
+        button::Status::Pressed => tok::bg_2(),
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: tok::text_mid(),
         border: Border { radius: 10.0.into(), ..Default::default() },
         shadow: Shadow::default(),
         ..Default::default()
