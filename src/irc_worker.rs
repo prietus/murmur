@@ -14,7 +14,54 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "batch",
     "invite-notify",
     "draft/chathistory",
+    // Tier-1 identity / presence:
+    "account-tag",
+    "extended-join",
+    "account-notify",
+    "away-notify",
+    "chghost",
+    "echo-message",
+    // Tier-2 NAMES enrichment:
+    "multi-prefix",
+    "userhost-in-names",
+    // Tier-2 protocol plumbing:
+    "labeled-response",
+    "sts",
+    // Tier-3 drafts:
+    "draft/multiline",
+    "draft/typing",
+    "draft/read-marker",
+    "draft/message-redaction",
 ];
+
+/// Subset of RPL_ISUPPORT (005) tokens that we actually act on. Accumulated
+/// across all 005 lines; the App receives the latest snapshot on each update.
+#[derive(Clone, Default, Debug)]
+pub struct ISupport {
+    /// `MODES=<n>` — max mode changes per single MODE command.
+    pub modes: Option<u8>,
+    /// `CHANTYPES=<chars>` — characters that mark a channel name (`#&`).
+    pub chantypes: String,
+    /// `PREFIX=(modes)prefixes` — raw mapping (e.g. `(ohv)@%+`).
+    pub prefix: String,
+    /// `CASEMAPPING=<name>` — `ascii`, `rfc1459`, `rfc1459-strict`, `rfc7613`.
+    pub casemapping: String,
+    /// `NETWORK=<name>` — human-readable network name.
+    pub network: Option<String>,
+}
+
+/// One entry from a NAMES reply (or a JOIN). Enriched with `multi-prefix`
+/// + `userhost-in-names` data when those caps are acked, otherwise just
+/// the bare nick.
+#[derive(Clone, Debug)]
+pub struct MemberEntry {
+    pub nick: String,
+    /// All channel prefixes for this member, highest-priority first
+    /// (e.g. `"@+"`, `"@"`, `"+"`, `""`).
+    pub prefixes: String,
+    /// `ident@host` without the nick, if `userhost-in-names` is acked.
+    pub userhost: Option<String>,
+}
 
 /// Per-message metadata extracted from IRCv3 tags.
 #[derive(Clone, Default, Debug)]
@@ -28,12 +75,30 @@ pub struct MsgMeta {
     /// Lower-case batch kind (e.g. "chathistory", "netsplit") looked up
     /// from the open-batch table when the message was processed.
     pub batch_kind: Option<String>,
+    /// IRCv3 `account` tag — the sender's services account name when
+    /// `account-tag` is negotiated. `None` means logged-out or unsupported.
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct BatchInfo {
     kind: String,
     params: Vec<String>,
+    /// For `draft/multiline` batches, the accumulated chunks collected
+    /// across PRIVMSGs inside the batch.
+    chunks: Vec<MultilineChunk>,
+}
+
+#[derive(Debug, Clone)]
+struct MultilineChunk {
+    target: String,
+    nick: String,
+    body: String,
+    is_action: bool,
+    /// True when the chunk carries the `draft/multiline-concat` tag and
+    /// should join the previous one without a newline separator.
+    concat: bool,
+    meta: MsgMeta,
 }
 
 #[derive(Clone)]
@@ -47,6 +112,9 @@ pub enum Outgoing {
     /// Fetch the most recent `limit` messages for `target`. Sent as
     /// `CHATHISTORY LATEST <target> * <limit>`.
     ChatHistoryLatest { target: String, limit: u32 },
+    /// `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>` — list
+    /// targets with activity in the given window.
+    ChatHistoryTargets { from_ts: String, to_ts: String, limit: u32 },
     /// `WHOIS <nick>`. Replies arrive as numerics (311/312/317/318/319/330/671).
     Whois(String),
     /// `AWAY :<msg>` to set, `AWAY` (no arg) to clear.
@@ -62,6 +130,32 @@ pub enum Outgoing {
     /// `MODE <target> <modes> [args...]`. Sent raw to avoid the typed
     /// `Mode<ChannelMode>` parsing in `irc-proto`.
     Mode { target: String, modes: String, args: Vec<String> },
+    /// Send a `draft/typing` TAGMSG to `target` indicating our state.
+    Typing { target: String, state: TypingState },
+    /// `MARKREAD <target> [timestamp=<iso>]` (draft/read-marker).
+    /// `timestamp = None` queries the current marker.
+    MarkRead { target: String, timestamp: Option<String> },
+    /// `REDACT <target> <msgid> [:reason]` (draft/message-redaction).
+    Redact { target: String, msgid: String, reason: Option<String> },
+    /// Send a `+draft/reply=<msgid>` TAGMSG carrying an emoji reaction.
+    React { target: String, msgid: String, emoji: String },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TypingState {
+    Active,
+    Paused,
+    Done,
+}
+
+impl TypingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            TypingState::Active => "active",
+            TypingState::Paused => "paused",
+            TypingState::Done => "done",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -75,13 +169,40 @@ pub enum Event {
     Disconnected,
     Privmsg { target: String, nick: String, body: String, meta: MsgMeta },
     Action { target: String, nick: String, body: String, meta: MsgMeta },
-    UserJoined { channel: String, nick: String, meta: MsgMeta },
+    UserJoined {
+        channel: String,
+        nick: String,
+        /// `ident@host` from the message prefix when present.
+        userhost: Option<String>,
+        /// Services account from `extended-join` (None means logged-out/`*`).
+        account: Option<String>,
+        /// Realname from `extended-join`.
+        realname: Option<String>,
+        meta: MsgMeta,
+    },
     UserLeft { channel: String, nick: String, meta: MsgMeta },
     NickChanged { old: String, new: String, meta: MsgMeta },
-    Names { channel: String, nicks: Vec<String> },
+    Names { channel: String, members: Vec<MemberEntry> },
     Topic { channel: String, topic: String },
     Notice { from: String, text: String, meta: MsgMeta },
     CtcpReply { from: String, query: String, args: String },
+    /// `account-notify`: a user logged in/out of services.
+    AccountChanged { nick: String, account: Option<String>, meta: MsgMeta },
+    /// `away-notify`: a user marked themselves away or returned.
+    AwayChanged { nick: String, message: Option<String>, meta: MsgMeta },
+    /// `chghost`: a user's ident/host changed in place.
+    HostChanged { nick: String, ident: String, host: String, meta: MsgMeta },
+    /// `RPL_ISUPPORT` (005) accumulated snapshot — sent each time the
+    /// server announces new tokens.
+    ISupport(ISupport),
+    /// `draft/typing` TAGMSG from another user.
+    TypingChanged { target: String, nick: String, state: TypingState },
+    /// `draft/read-marker` MARKREAD reply or push.
+    ReadMarker { target: String, timestamp: Option<String> },
+    /// `draft/message-redaction` REDACT — a message was deleted.
+    Redacted { target: String, msgid: String, by_nick: String, reason: Option<String> },
+    /// Inbound emoji reaction (TAGMSG with `+draft/reply` and a body emoji).
+    Reaction { target: String, target_msgid: String, nick: String, emoji: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +216,11 @@ enum AuthPhase {
 
 #[derive(Debug, Default)]
 struct CapState {
-    /// Caps the server announced via CAP LS (key = cap name, value = optional value).
+    /// Caps the server announced via CAP LS.
     available: HashSet<String>,
+    /// Map of cap name → value for caps that came as `name=value`
+    /// (used by `sts`, `draft/multiline`, etc.).
+    values: HashMap<String, String>,
     /// Whether we've seen the final (non-multiline) CAP LS response.
     ls_complete: bool,
     /// Caps the server actually ACKed for this session.
@@ -104,11 +228,40 @@ struct CapState {
 }
 
 pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'static {
-    let cfg = cfg.clone();
+    let mut cfg = cfg.clone();
+    // Apply a persisted IRCv3 STS policy if there is one. The policy says
+    // "future connections to this host must use TLS on this port until X".
+    let sts_applied = if let Some(policy) = crate::config::sts::get_active(&cfg.server) {
+        let mut changed = false;
+        if !cfg.use_tls {
+            cfg.use_tls = true;
+            changed = true;
+        }
+        if cfg.port != policy.port {
+            cfg.port = policy.port;
+            changed = true;
+        }
+        changed.then_some(policy.port)
+    } else {
+        None
+    };
     iced::stream::channel(128, move |mut out: mpsc::Sender<Event>| async move {
         let (otx, mut orx) = mpsc::channel::<Outgoing>(64);
         if out.send(Event::Ready(otx)).await.is_err() {
             return;
+        }
+
+        if let Some(port) = sts_applied {
+            let _ = out
+                .send(Event::Notice {
+                    from: "*".into(),
+                    text: format!(
+                        "STS policy active: forcing TLS on port {port} for {}",
+                        cfg.server
+                    ),
+                    meta: MsgMeta::default(),
+                })
+                .await;
         }
 
         let auth_mode = cfg.auth_mode();
@@ -163,6 +316,7 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
         let mut auth_phase = AuthPhase::AwaitingCapLs;
         let mut cap_state = CapState::default();
         let mut batches: HashMap<String, BatchInfo> = HashMap::new();
+        let mut isupport = ISupport::default();
 
         if use_sasl {
             let mech = match auth_mode {
@@ -205,6 +359,24 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                     let acked: Vec<String> =
                                         cap_state.acked.iter().cloned().collect();
                                     let _ = out.send(Event::CapsAcked(acked)).await;
+                                    // Brief positive confirmation in &status —
+                                    // helpful when troubleshooting cert/auth.
+                                    let mech = match auth_mode {
+                                        AuthMode::SaslExternal => "EXTERNAL",
+                                        AuthMode::SaslPlain => "PLAIN",
+                                        _ => "",
+                                    };
+                                    if !mech.is_empty() {
+                                        let _ = out
+                                            .send(Event::Notice {
+                                                from: "*".into(),
+                                                text: format!(
+                                                    "SASL {mech} authentication successful"
+                                                ),
+                                                meta: MsgMeta::default(),
+                                            })
+                                            .await;
+                                    }
                                     let _ = out.send(Event::Connected).await;
                                 }
                                 AuthOutcome::Failed(reason) => {
@@ -233,11 +405,16 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                     BatchInfo {
                                         kind,
                                         params: params.clone().unwrap_or_default(),
+                                        chunks: Vec::new(),
                                     },
                                 );
                             } else if let Some(id) = tag_with_sign.strip_prefix('-') {
                                 if let Some(info) = batches.remove(id) {
-                                    if let Some(text) = batch_summary(&info) {
+                                    if let Some(ev) = finalize_multiline(&info) {
+                                        if out.send(ev).await.is_err() {
+                                            return;
+                                        }
+                                    } else if let Some(text) = batch_summary(&info) {
                                         let _ = out
                                             .send(Event::Notice {
                                                 from: "*".into(),
@@ -250,7 +427,13 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                             }
                             continue;
                         }
-                        for ev in translate(msg, &batches) {
+                        // If this message belongs to an open draft/multiline
+                        // batch, accumulate it and don't emit a per-chunk
+                        // event — the batch close will produce one combined.
+                        if accumulate_multiline_chunk(&msg, &mut batches) {
+                            continue;
+                        }
+                        for ev in translate(msg, &batches, &mut isupport) {
                             if out.send(ev).await.is_err() {
                                 return;
                             }
@@ -298,6 +481,17 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                 ],
                             ));
                         }
+                        Some(Outgoing::ChatHistoryTargets { from_ts, to_ts, limit }) => {
+                            let _ = sender.send(Command::Raw(
+                                "CHATHISTORY".into(),
+                                vec![
+                                    "TARGETS".into(),
+                                    format!("timestamp={from_ts}"),
+                                    format!("timestamp={to_ts}"),
+                                    limit.to_string(),
+                                ],
+                            ));
+                        }
                         Some(Outgoing::Whois(target)) => {
                             let _ = sender.send(Command::WHOIS(None, target));
                         }
@@ -322,6 +516,43 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                             argv.push(modes);
                             argv.extend(args);
                             let _ = sender.send(Command::Raw("MODE".into(), argv));
+                        }
+                        Some(Outgoing::Typing { target, state }) => {
+                            let _ = sender.send(Message {
+                                tags: Some(vec![Tag(
+                                    "+typing".into(),
+                                    Some(state.as_str().into()),
+                                )]),
+                                prefix: None,
+                                command: Command::Raw("TAGMSG".into(), vec![target]),
+                            });
+                        }
+                        Some(Outgoing::MarkRead { target, timestamp }) => {
+                            let mut argv = vec![target];
+                            if let Some(ts) = timestamp {
+                                argv.push(format!("timestamp={ts}"));
+                            }
+                            let _ = sender.send(Command::Raw("MARKREAD".into(), argv));
+                        }
+                        Some(Outgoing::Redact { target, msgid, reason }) => {
+                            let mut argv = vec![target, msgid];
+                            if let Some(r) = reason {
+                                argv.push(r);
+                            }
+                            let _ = sender.send(Command::Raw("REDACT".into(), argv));
+                        }
+                        Some(Outgoing::React { target, msgid, emoji }) => {
+                            // Reactions piggyback on TAGMSG with +draft/reply
+                            // pointing at the target msgid; body lives in the
+                            // +draft/react tag.
+                            let _ = sender.send(Message {
+                                tags: Some(vec![
+                                    Tag("+draft/reply".into(), Some(msgid)),
+                                    Tag("+draft/react".into(), Some(emoji)),
+                                ]),
+                                prefix: None,
+                                command: Command::Raw("TAGMSG".into(), vec![target]),
+                            });
                         }
                         None => {}
                     }
@@ -364,17 +595,31 @@ fn handle_auth_msg(
                 _ => (false, ""),
             };
             for token in listed.split_whitespace() {
-                let name = token
-                    .split('=')
-                    .next()
-                    .unwrap_or(token)
-                    .to_ascii_lowercase();
-                caps.available.insert(name);
+                let (name_raw, value) = match token.split_once('=') {
+                    Some((n, v)) => (n, Some(v.to_string())),
+                    None => (token, None),
+                };
+                let name = name_raw.to_ascii_lowercase();
+                caps.available.insert(name.clone());
+                if let Some(v) = value {
+                    caps.values.insert(name, v);
+                }
             }
             if more {
                 return AuthOutcome::Pending;
             }
             caps.ls_complete = true;
+
+            // STS — if the server announced an `sts=duration=N,port=P` value
+            // and we're already on TLS, persist the policy so the next
+            // connection attempt forces the right port + TLS.
+            if let Some(value) = caps.values.get("sts").cloned() {
+                if let Some((port, duration)) = parse_sts_value(&value) {
+                    if cfg.use_tls && duration > 0 {
+                        let _ = crate::config::sts::upsert(&cfg.server, port, duration);
+                    }
+                }
+            }
 
             // Build REQ from the intersection of what we want and what
             // the server offers. SASL piggybacks if configured.
@@ -530,6 +775,26 @@ fn is_auth_wire(msg: &Message) -> bool {
     )
 }
 
+// Parse the IRCv3 `sts=` cap value into `(port, duration_secs)`.
+// Format: comma-separated `key=value` pairs; `port` and `duration` are
+// the two we care about. Returns None if `port` is missing.
+fn parse_sts_value(s: &str) -> Option<(u16, u64)> {
+    let mut port: Option<u16> = None;
+    let mut duration: u64 = 0;
+    for part in s.split(',') {
+        let (k, v) = match part.split_once('=') {
+            Some(kv) => kv,
+            None => (part, ""),
+        };
+        match k.trim() {
+            "port" => port = v.trim().parse().ok(),
+            "duration" => duration = v.trim().parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    port.map(|p| (p, duration))
+}
+
 fn build_plain_payload(user: &str, pass: &str) -> Vec<u8> {
     if user.is_empty() && pass.is_empty() {
         return Vec::new();
@@ -608,6 +873,10 @@ fn extract_meta(
                 }
             }
             "msgid" => m.msgid = v.clone(),
+            "account" => {
+                // `account=*` means logged-out per IRCv3; treat as None.
+                m.account = v.clone().filter(|s| !s.is_empty() && s != "*");
+            }
             "batch" => {
                 m.batch = v.clone();
                 if let Some(id) = v.as_deref() {
@@ -620,6 +889,77 @@ fn extract_meta(
         }
     }
     m
+}
+
+// Returns true if the message was a PRIVMSG inside an open multiline batch
+// (and was therefore absorbed). Caller should skip further processing.
+fn accumulate_multiline_chunk(
+    msg: &Message,
+    batches: &mut HashMap<String, BatchInfo>,
+) -> bool {
+    let Command::PRIVMSG(target, body) = &msg.command else { return false };
+    let Some(tags) = &msg.tags else { return false };
+    // Find batch tag.
+    let mut batch_id: Option<&str> = None;
+    let mut concat = false;
+    for Tag(k, v) in tags {
+        match k.as_str() {
+            "batch" => batch_id = v.as_deref(),
+            "draft/multiline-concat" => concat = true,
+            _ => {}
+        }
+    }
+    let Some(id) = batch_id else { return false };
+    // Compute everything that needs `&batches` before taking the mut borrow.
+    if batches.get(id).map(|i| i.kind.as_str()) != Some("draft/multiline") {
+        return false;
+    }
+    let chunk_meta = extract_meta(&msg.tags, batches);
+    let nick = match &msg.prefix {
+        Some(Prefix::Nickname(n, _, _)) => n.clone(),
+        Some(Prefix::ServerName(s)) => s.clone(),
+        None => "*".into(),
+    };
+    // Detect /me-style chunks so we surface them as Action when all chunks
+    // are actions (a single multiline message can't mix kinds in practice).
+    let (clean_body, is_action) = match unwrap_ctcp_action(body) {
+        Some(action) => (action, true),
+        None => (body.clone(), false),
+    };
+    let Some(info) = batches.get_mut(id) else { return false };
+    info.chunks.push(MultilineChunk {
+        target: target.clone(),
+        nick,
+        body: strip_irc_formatting(&clean_body),
+        is_action,
+        concat,
+        meta: chunk_meta,
+    });
+    true
+}
+
+// On batch close, fold accumulated multiline chunks into a single event.
+fn finalize_multiline(info: &BatchInfo) -> Option<Event> {
+    if info.kind != "draft/multiline" || info.chunks.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    for (i, chunk) in info.chunks.iter().enumerate() {
+        if i > 0 && !chunk.concat {
+            body.push('\n');
+        }
+        body.push_str(&chunk.body);
+    }
+    let first = &info.chunks[0];
+    let is_action = info.chunks.iter().all(|c| c.is_action);
+    let target = first.target.clone();
+    let nick = first.nick.clone();
+    let meta = first.meta.clone();
+    if is_action {
+        Some(Event::Action { target, nick, body, meta })
+    } else {
+        Some(Event::Privmsg { target, nick, body, meta })
+    }
 }
 
 fn batch_summary(info: &BatchInfo) -> Option<String> {
@@ -642,13 +982,31 @@ fn parse_iso_hhmm(s: &str) -> Option<String> {
     }
 }
 
-fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
-    let nick = match &msg.prefix {
-        Some(Prefix::Nickname(n, _, _)) => n.clone(),
-        Some(Prefix::ServerName(s)) => s.clone(),
-        None => "*".into(),
+fn translate(
+    msg: Message,
+    batches: &HashMap<String, BatchInfo>,
+    isupport: &mut ISupport,
+) -> Vec<Event> {
+    let (nick, sender_userhost) = match &msg.prefix {
+        Some(Prefix::Nickname(n, ident, host)) => {
+            let uh = if !ident.is_empty() && !host.is_empty() {
+                Some(format!("{ident}@{host}"))
+            } else {
+                None
+            };
+            (n.clone(), uh)
+        }
+        Some(Prefix::ServerName(s)) => (s.clone(), None),
+        None => ("*".into(), None),
     };
     let meta = extract_meta(&msg.tags, batches);
+    // Snapshot the raw tags before the `msg.command` move; TAGMSG handlers
+    // need them after we've matched on command.
+    let msg_tags_raw: Vec<(String, Option<String>)> = msg
+        .tags
+        .as_ref()
+        .map(|ts| ts.iter().map(|Tag(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
     match msg.command {
         Command::PRIVMSG(target, body) => {
             if let Some(action) = unwrap_ctcp_action(&body) {
@@ -671,9 +1029,40 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
                 }]
             }
         }
-        Command::JOIN(channel, _, _) => vec![Event::UserJoined { channel, nick, meta }],
+        Command::JOIN(channel, account, realname) => {
+            // With `extended-join`, JOIN carries `<account> :<realname>`.
+            // `*` (or empty) means the user is not logged in to services.
+            let account = account.filter(|s| !s.is_empty() && s != "*");
+            let realname = realname.filter(|s| !s.is_empty());
+            vec![Event::UserJoined {
+                channel,
+                nick,
+                userhost: sender_userhost,
+                account,
+                realname,
+                meta,
+            }]
+        }
         Command::PART(channel, _) => vec![Event::UserLeft { channel, nick, meta }],
         Command::NICK(new) => vec![Event::NickChanged { old: nick, new, meta }],
+        Command::ACCOUNT(account) => {
+            // `account-notify`: a remote user's services-login state changed.
+            let account = if account == "*" || account.is_empty() {
+                None
+            } else {
+                Some(account)
+            };
+            vec![Event::AccountChanged { nick, account, meta }]
+        }
+        Command::AWAY(message) => {
+            // `away-notify`: other users send AWAY when they change state.
+            // Our own AWAY-set reflects back as 305/306 numerics instead.
+            let message = message.filter(|s| !s.is_empty());
+            vec![Event::AwayChanged { nick, message, meta }]
+        }
+        Command::CHGHOST(ident, host) => {
+            vec![Event::HostChanged { nick, ident, host, meta }]
+        }
         Command::TOPIC(channel, Some(topic)) => {
             vec![Event::Topic { channel, topic: strip_irc_formatting(&topic) }]
         }
@@ -723,14 +1112,29 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
             }],
         },
         Command::Response(code, args) => match code {
+            Response::RPL_ISUPPORT => {
+                // Skip args[0] (our nick) and the trailing
+                // ":are supported by this server".
+                let token_count = args.len().saturating_sub(1);
+                let mut changed = false;
+                for tok in args.iter().skip(1).take(token_count.saturating_sub(1)) {
+                    if apply_isupport_token(isupport, tok) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    vec![Event::ISupport(isupport.clone())]
+                } else {
+                    vec![]
+                }
+            }
             Response::RPL_NAMREPLY if args.len() >= 4 => {
                 let channel = args[2].clone();
-                let nicks = args[3]
+                let members = args[3]
                     .split_whitespace()
-                    .map(strip_prefix)
-                    .filter(|n| !n.is_empty())
+                    .filter_map(parse_name_entry)
                     .collect();
-                vec![Event::Names { channel, nicks }]
+                vec![Event::Names { channel, members }]
             }
             Response::RPL_TOPIC if args.len() >= 3 => {
                 vec![Event::Topic {
@@ -750,6 +1154,50 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>) -> Vec<Event> {
                 if let Some(text) = format_extended_numeric(n, args) {
                     return vec![Event::Notice { from: "*".into(), text, meta }];
                 }
+            }
+            // IRCv3 standard replies: FAIL/WARN/NOTE <command> <code> [context]* :description
+            if let Some(text) = format_standard_reply(cmd, args) {
+                return vec![Event::Notice { from: "*".into(), text, meta }];
+            }
+            // CHATHISTORY TARGETS reply: one line per target.
+            //   :server CHATHISTORY TARGETS <target> <timestamp>
+            if cmd.eq_ignore_ascii_case("CHATHISTORY")
+                && args.first().map(|s| s.eq_ignore_ascii_case("TARGETS")).unwrap_or(false)
+                && args.len() >= 3
+            {
+                return vec![Event::Notice {
+                    from: "*".into(),
+                    text: format!("history target: {} @ {}", args[1], args[2]),
+                    meta,
+                }];
+            }
+            // TAGMSG carries no body — the meaning lives in IRCv3 tags
+            // (`+typing`, `+draft/react`+`+draft/reply`, etc.).
+            if cmd.eq_ignore_ascii_case("TAGMSG") && !args.is_empty() {
+                if let Some(events) = parse_tagmsg_event(&nick, &args[0], &msg_tags_raw) {
+                    return events;
+                }
+                return vec![];
+            }
+            // MARKREAD: `:server MARKREAD <target> [timestamp=<iso>]`
+            if cmd.eq_ignore_ascii_case("MARKREAD") && !args.is_empty() {
+                let target = args[0].clone();
+                let timestamp = args.iter()
+                    .skip(1)
+                    .find_map(|s| s.strip_prefix("timestamp=").map(str::to_string));
+                return vec![Event::ReadMarker { target, timestamp }];
+            }
+            // REDACT: `:nick REDACT <target> <msgid> [:reason]`
+            if cmd.eq_ignore_ascii_case("REDACT") && args.len() >= 2 {
+                let target = args[0].clone();
+                let msgid = args[1].clone();
+                let reason = args.get(2).cloned();
+                return vec![Event::Redacted {
+                    target,
+                    msgid,
+                    by_nick: nick.clone(),
+                    reason,
+                }];
             }
             vec![]
         }
@@ -849,8 +1297,137 @@ fn format_numeric(code: Response, args: &[String]) -> Option<String> {
         Response::ERR_NOPRIVILEGES => {
             Some("permission denied: server operator required".into())
         }
+        // SASL flow surfacing — these come *after* CAP negotiation so the
+        // status buffer exists by then.
+        Response::RPL_LOGGEDIN if args.len() >= 4 => Some(format!(
+            "logged in as {} ({})",
+            p(2),
+            args.last().map(String::as_str).unwrap_or("")
+        )),
+        Response::RPL_LOGGEDOUT => {
+            Some("logged out of services".into())
+        }
+        Response::RPL_SASLSUCCESS => Some("SASL authentication successful".into()),
+        Response::ERR_SASLFAIL => Some(format!(
+            "SASL authentication failed: {}",
+            args.last().map(String::as_str).unwrap_or("")
+        )),
         _ => None,
     }
+}
+
+// TAGMSG dispatch — the protocol uses tag-only PRIVMSG-like messages.
+// We look for the tags we know about and emit the appropriate event.
+fn parse_tagmsg_event(
+    nick: &str,
+    target: &str,
+    tags: &[(String, Option<String>)],
+) -> Option<Vec<Event>> {
+    let mut typing: Option<TypingState> = None;
+    let mut reply_msgid: Option<String> = None;
+    let mut react_emoji: Option<String> = None;
+    for (k, v) in tags {
+        match (k.as_str(), v.as_deref()) {
+            ("+typing", Some("active")) => typing = Some(TypingState::Active),
+            ("+typing", Some("paused")) => typing = Some(TypingState::Paused),
+            ("+typing", Some("done")) => typing = Some(TypingState::Done),
+            ("+draft/reply", Some(id)) if !id.is_empty() => {
+                reply_msgid = Some(id.to_string())
+            }
+            ("+draft/react", Some(e)) if !e.is_empty() => react_emoji = Some(e.to_string()),
+            _ => {}
+        }
+    }
+    if let (Some(msgid), Some(emoji)) = (reply_msgid, react_emoji) {
+        return Some(vec![Event::Reaction {
+            target: target.to_string(),
+            target_msgid: msgid,
+            nick: nick.to_string(),
+            emoji,
+        }]);
+    }
+    if let Some(state) = typing {
+        return Some(vec![Event::TypingChanged {
+            target: target.to_string(),
+            nick: nick.to_string(),
+            state,
+        }]);
+    }
+    None
+}
+
+// Parse a single ISUPPORT token (`KEY` or `KEY=value`) into the snapshot.
+// Returns true when one of the tracked tokens actually changed.
+fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
+    let (key, value) = match tok.split_once('=') {
+        Some((k, v)) => (k, Some(v)),
+        None => (tok, None),
+    };
+    match key {
+        "MODES" => {
+            let new = value.and_then(|v| v.parse::<u8>().ok());
+            if isupport.modes != new {
+                isupport.modes = new;
+                return true;
+            }
+        }
+        "CHANTYPES" => {
+            let new = value.unwrap_or("").to_string();
+            if isupport.chantypes != new {
+                isupport.chantypes = new;
+                return true;
+            }
+        }
+        "PREFIX" => {
+            let new = value.unwrap_or("").to_string();
+            if isupport.prefix != new {
+                isupport.prefix = new;
+                return true;
+            }
+        }
+        "CASEMAPPING" => {
+            let new = value.unwrap_or("").to_string();
+            if isupport.casemapping != new {
+                isupport.casemapping = new;
+                return true;
+            }
+        }
+        "NETWORK" => {
+            let new = value.map(str::to_string);
+            if isupport.network != new {
+                isupport.network = new;
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+// IRCv3 standard replies: FAIL/WARN/NOTE.
+// Layout: `<TYPE> <command> <code> [<context>...] :<description>`.
+// Returns a one-line summary or None if this isn't a standard reply.
+fn format_standard_reply(cmd: &str, args: &[String]) -> Option<String> {
+    let kind = match cmd.to_ascii_uppercase().as_str() {
+        "FAIL" => "fail",
+        "WARN" => "warn",
+        "NOTE" => "note",
+        _ => return None,
+    };
+    if args.len() < 3 {
+        return None;
+    }
+    let command = &args[0];
+    let code = &args[1];
+    let description = args.last().map(String::as_str).unwrap_or("");
+    let ctx = &args[2..args.len().saturating_sub(1)];
+    let mut head = format!("{kind} {command} {code}");
+    if !ctx.is_empty() {
+        head.push_str(" [");
+        head.push_str(&ctx.join(" "));
+        head.push(']');
+    }
+    Some(format!("{head}: {description}"))
 }
 
 // Format numeric codes that irc-proto doesn't enumerate.
@@ -947,8 +1524,33 @@ fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars>, max: usize) -> usi
     n
 }
 
-fn strip_prefix(n: &str) -> String {
-    n.trim_start_matches(['@', '+', '%', '~', '&']).to_string()
+/// Channel mode prefixes that may appear in front of nicks in NAMES,
+/// in decreasing-priority order: founder, admin, op, halfop, voice.
+const NAME_PREFIX_CHARS: &[char] = &['~', '&', '@', '%', '+'];
+
+fn parse_name_entry(token: &str) -> Option<MemberEntry> {
+    if token.is_empty() {
+        return None;
+    }
+    let prefix_len = token
+        .chars()
+        .take_while(|c| NAME_PREFIX_CHARS.contains(c))
+        .map(char::len_utf8)
+        .sum();
+    let (prefixes, rest) = token.split_at(prefix_len);
+    if rest.is_empty() {
+        return None;
+    }
+    // With `userhost-in-names`, rest is `nick!ident@host`. Without it, just `nick`.
+    let (nick, userhost) = match rest.split_once('!') {
+        Some((n, uh)) if !uh.is_empty() => (n.to_string(), Some(uh.to_string())),
+        _ => (rest.to_string(), None),
+    };
+    Some(MemberEntry {
+        nick,
+        prefixes: prefixes.to_string(),
+        userhost,
+    })
 }
 
 fn unwrap_ctcp_action(body: &str) -> Option<String> {

@@ -416,3 +416,76 @@ channels = ["#rust"]
 # /ignores to list. Changes persist back to this file.
 # ignored_nicks = ["spammer42"]
 "##;
+
+/// IRCv3 Strict Transport Security policy storage.
+///
+/// Persists `(host -> StsPolicy)` in `sts.toml` next to `config.toml`. The
+/// worker parses the `sts=duration=N,port=P` CAP-LS value, calls `upsert`,
+/// and on the *next* connection attempt `get_active(host)` returns the
+/// override that should be applied to `NetworkConfig`.
+pub mod sts {
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StsPolicy {
+        pub port: u16,
+        pub expires_at: u64,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct StsFile {
+        #[serde(default)]
+        policies: HashMap<String, StsPolicy>,
+    }
+
+    fn path() -> Option<PathBuf> {
+        super::config_path()
+            .and_then(|p| p.parent().map(|d| d.join("sts.toml")))
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
+
+    fn load() -> StsFile {
+        let Some(p) = path() else { return StsFile::default() };
+        let Ok(text) = std::fs::read_to_string(&p) else { return StsFile::default() };
+        toml::from_str::<StsFile>(&text).unwrap_or_default()
+    }
+
+    fn save(file: &StsFile) -> std::io::Result<()> {
+        let Some(p) = path() else {
+            return Err(std::io::Error::other("could not resolve config dir"));
+        };
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(file)
+            .map_err(std::io::Error::other)?;
+        std::fs::write(&p, text)
+    }
+
+    /// Returns the unexpired policy for `host`, if any.
+    pub fn get_active(host: &str) -> Option<StsPolicy> {
+        let file = load();
+        let key = host.to_ascii_lowercase();
+        file.policies
+            .get(&key)
+            .cloned()
+            .filter(|p| p.expires_at > now_secs())
+    }
+
+    /// Upsert a policy. `duration_secs` is added to the current time.
+    pub fn upsert(host: &str, port: u16, duration_secs: u64) -> std::io::Result<()> {
+        let mut file = load();
+        let expires_at = now_secs().saturating_add(duration_secs);
+        file.policies.insert(
+            host.to_ascii_lowercase(),
+            StsPolicy { port, expires_at },
+        );
+        save(&file)
+    }
+}

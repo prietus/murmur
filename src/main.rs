@@ -87,6 +87,9 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/ban", "ban a nick or mask on the current channel (+b)", true),
     ("/unban", "lift a ban (-b) on the current channel", true),
     ("/invite", "invite a nick to a channel: /invite <nick> [#chan]", true),
+    ("/history", "list targets with chathistory activity (last 7 days, max 50)", false),
+    ("/delete", "delete your last message — or /delete <msgid> for a specific one", false),
+    ("/react", "react with emoji: /react <emoji> (on your last received msg) or /react <msgid> <emoji>", true),
 ];
 
 fn main() -> iced::Result {
@@ -474,6 +477,13 @@ struct NetworkState {
     autoconnect_enabled: bool,
     last_selected: Option<usize>,
     caps_acked: HashSet<String>,
+    /// Lowercased nicks currently marked away (from `away-notify`).
+    away_nicks: HashSet<String>,
+    /// Lowercased nick → services account (from `account-notify`
+    /// + the `account` tag + `extended-join`).
+    accounts: HashMap<String, String>,
+    /// Cached ISUPPORT (005) features for this connection.
+    isupport: irc_worker::ISupport,
 }
 
 struct App {
@@ -513,6 +523,13 @@ struct App {
     settings_net_channel_input: String,
     settings_save_error: Option<String>,
     settings_save_info: Option<String>,
+    /// (network, bucket, nick) → last time we saw a `+typing=active` TAGMSG.
+    /// Entries expire after 6 seconds without renewal (per spec).
+    typing_observed: HashMap<(NetworkId, String, String), Instant>,
+    /// When we last sent a `+typing=active` TAGMSG for a given (network, target).
+    typing_sent: HashMap<(NetworkId, String), Instant>,
+    /// Per-target server-side read marker (timestamp last reported by MARKREAD).
+    read_markers: HashMap<(NetworkId, String), String>,
 }
 
 struct TabState {
@@ -523,12 +540,24 @@ struct TabState {
     expected_input: String,
 }
 
+// Per-member metadata gathered from NAMES / JOIN with multi-prefix +
+// userhost-in-names. Keyed (in the parallel map on Channel) by the
+// member's nick exactly as it appears in `members`.
+#[derive(Clone, Default)]
+struct MemberMeta {
+    /// Highest-priority channel prefix character (`~&@%+`), or empty.
+    prefixes: String,
+    userhost: Option<String>,
+}
+
 struct Channel {
     network_id: NetworkId,
     name: String,
     topic: Option<String>,
     messages: Vec<ChatMessage>,
     members: Vec<String>,
+    /// Metadata for entries in `members`, keyed by nick.
+    member_meta: HashMap<String, MemberMeta>,
     dimm: bool,
     hide_joinpart: bool,
     hover_anim: Animation<bool>,
@@ -563,8 +592,9 @@ struct ChatMessage {
     inserted_at: Instant,
     mono_secs: u64,
     kind: MsgKind,
-    #[allow(dead_code)]
     msgid: Option<String>,
+    /// Emoji reactions on this message: emoji → set of reactor nicks.
+    reactions: HashMap<String, HashSet<String>>,
 }
 
 impl Default for App {
@@ -613,6 +643,9 @@ impl Default for App {
             settings_net_channel_input: String::new(),
             settings_save_error: None,
             settings_save_info: None,
+            typing_observed: HashMap::new(),
+            typing_sent: HashMap::new(),
+            read_markers: HashMap::new(),
         };
 
         match config::load() {
@@ -712,6 +745,9 @@ fn build_app_from_cfg(
             autoconnect_enabled: ncfg.autoconnect,
             last_selected,
             caps_acked: HashSet::new(),
+            away_nicks: HashSet::new(),
+            accounts: HashMap::new(),
+            isupport: irc_worker::ISupport::default(),
         });
     }
 
@@ -751,6 +787,7 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         name: "&status".into(),
         topic: if topic.is_empty() { None } else { Some(topic.into()) },
         members: Vec::new(),
+        member_meta: HashMap::new(),
         messages,
         dimm: false,
         hide_joinpart: false,
@@ -791,6 +828,36 @@ fn parse_raw_line(line: &str) -> (String, Vec<String>) {
     (cmd, parts)
 }
 
+// Render a horizontal strip of reaction badges below a message:
+// each badge shows `<emoji> <count>` with a tinted background.
+fn reactions_row<'a>(
+    reactions: &'a HashMap<String, HashSet<String>>,
+) -> Element<'a, Message> {
+    let mut entries: Vec<(&String, &HashSet<String>)> = reactions.iter().collect();
+    entries.sort_by_key(|(emoji, _)| emoji.as_str());
+    let mut row_el = row![].spacing(tok::S2);
+    for (emoji, reactors) in entries {
+        let badge = container(
+            text(format!("{emoji} {}", reactors.len()))
+                .size(sz(11.0))
+                .color(tok::text_mid()),
+        )
+        .padding(pad(1.0, 6.0, 1.0, 6.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(tok::bg_hover())),
+            border: Border {
+                radius: 8.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        row_el = row_el.push(badge);
+    }
+    container(row_el)
+        .padding(pad(0.0, 0.0, tok::S1 as f32, 64.0))
+        .into()
+}
+
 fn system_line(body: &str, now: Instant) -> ChatMessage {
     ChatMessage {
         nick: "*".into(),
@@ -800,7 +867,7 @@ fn system_line(body: &str, now: Instant) -> ChatMessage {
         inserted_at: now,
         mono_secs: 0,
         kind: MsgKind::System,
-        msgid: None,
+        msgid: None, reactions: HashMap::new(),
     }
 }
 
@@ -813,7 +880,7 @@ fn joinpart_line(body: &str, now: Instant) -> ChatMessage {
         inserted_at: now,
         mono_secs: now.elapsed().as_secs(),
         kind: MsgKind::JoinPart,
-        msgid: None,
+        msgid: None, reactions: HashMap::new(),
     }
 }
 
@@ -842,7 +909,7 @@ fn chat_line_from_meta(
         inserted_at,
         mono_secs: now.elapsed().as_secs(),
         kind,
-        msgid: meta.msgid.clone(),
+        msgid: meta.msgid.clone(), reactions: HashMap::new(),
     }
 }
 
@@ -899,13 +966,23 @@ mod chatlog {
     }
 
     pub fn iso_now() -> String {
+        iso_offset_secs(0)
+    }
+
+    /// ISO 8601 timestamp for `days_ago * 86400` seconds before now.
+    pub fn iso_minus_days(days_ago: i64) -> String {
+        iso_offset_secs(-days_ago * 86_400)
+    }
+
+    fn iso_offset_secs(offset: i64) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let secs = (now % 60) as u32;
-        let mins = ((now / 60) % 60) as u32;
-        let hrs = ((now / 3600) % 24) as u32;
+            .unwrap_or(0)
+            .saturating_add(offset);
+        let secs = (now.rem_euclid(60)) as u32;
+        let mins = ((now.div_euclid(60)).rem_euclid(60)) as u32;
+        let hrs = ((now.div_euclid(3600)).rem_euclid(24)) as u32;
         let days = now.div_euclid(86400);
         let (y, m, d) = days_to_ymd(days);
         format!("{y:04}-{m:02}-{d:02}T{hrs:02}:{mins:02}:{secs:02}Z")
@@ -977,6 +1054,124 @@ impl App {
 
     // Returns the channel index for `name` within the given network,
     // creating an empty channel if none exists.
+    fn find_channel_in(&self, network_id: NetworkId, name: &str) -> Option<usize> {
+        self.channels
+            .iter()
+            .position(|c| c.network_id == network_id && c.name == name)
+    }
+
+    // Send a `+typing=active` TAGMSG for the current buffer if the server
+    // supports `draft/typing` and we haven't sent one in the last 3 seconds
+    // (per spec). Suppressed in &status and on empty input.
+    fn maybe_send_typing(&mut self, now: Instant) {
+        if self.input.trim().is_empty() {
+            self.send_typing_done();
+            return;
+        }
+        let Some(ch) = self.channels.get(self.selected) else { return };
+        if ch.name.starts_with('&') {
+            return;
+        }
+        let net_id = ch.network_id;
+        let target = ch.name.clone();
+        let supported = self
+            .net(net_id)
+            .is_some_and(|n| n.caps_acked.contains("draft/typing"));
+        if !supported {
+            return;
+        }
+        let key = (net_id, target.clone());
+        let send_now = self
+            .typing_sent
+            .get(&key)
+            .map(|t| now.duration_since(*t).as_secs() >= 3)
+            .unwrap_or(true);
+        if !send_now {
+            return;
+        }
+        if let Some(tx) = self.net_mut(net_id).and_then(|n| n.outgoing.as_mut()) {
+            let _ = tx.try_send(Outgoing::Typing {
+                target,
+                state: irc_worker::TypingState::Active,
+            });
+            self.typing_sent.insert(key, now);
+        }
+    }
+
+    fn send_typing_done(&mut self) {
+        let Some(ch) = self.channels.get(self.selected) else { return };
+        if ch.name.starts_with('&') {
+            return;
+        }
+        let net_id = ch.network_id;
+        let target = ch.name.clone();
+        let key = (net_id, target.clone());
+        if self.typing_sent.remove(&key).is_none() {
+            return;
+        }
+        let supported = self
+            .net(net_id)
+            .is_some_and(|n| n.caps_acked.contains("draft/typing"));
+        if !supported {
+            return;
+        }
+        if let Some(tx) = self.net_mut(net_id).and_then(|n| n.outgoing.as_mut()) {
+            let _ = tx.try_send(Outgoing::Typing {
+                target,
+                state: irc_worker::TypingState::Done,
+            });
+        }
+    }
+
+    // Return a comma-separated list of nicks typing in the active buffer.
+    // Entries older than 6 seconds are considered expired and ignored.
+    fn typing_text(&self) -> Option<String> {
+        let ch = self.channels.get(self.selected)?;
+        if ch.name.starts_with('&') {
+            return None;
+        }
+        let now = Instant::now();
+        let mut nicks: Vec<&str> = self
+            .typing_observed
+            .iter()
+            .filter_map(|((net, bucket, nick), seen)| {
+                if *net == ch.network_id
+                    && bucket == &ch.name
+                    && now.duration_since(*seen).as_secs() < 6
+                {
+                    Some(nick.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if nicks.is_empty() {
+            return None;
+        }
+        nicks.sort();
+        let body = match nicks.len() {
+            1 => format!("{} is typing…", nicks[0]),
+            2 => format!("{} and {} are typing…", nicks[0], nicks[1]),
+            _ => format!("{} others are typing…", nicks.len()),
+        };
+        Some(body)
+    }
+
+    // Maps an inbound message's `target` to the channel-buffer name we
+    // store it under: DM messages live under the *other* nick's name,
+    // channel messages stay under the channel.
+    fn bucket_for_target(&self, network_id: NetworkId, target: &str, nick: &str) -> String {
+        let my_nick = self
+            .net(network_id)
+            .map(|n| n.cfg.nickname.clone())
+            .unwrap_or_default();
+        if !my_nick.is_empty() && target == my_nick {
+            nick.to_string()
+        } else {
+            target.to_string()
+        }
+    }
+
     fn ensure_channel_in(&mut self, network_id: NetworkId, name: &str) -> usize {
         if let Some(i) = self
             .channels
@@ -991,6 +1186,7 @@ impl App {
             topic: None,
             messages: Vec::new(),
             members: Vec::new(),
+            member_meta: HashMap::new(),
             dimm: false,
             hide_joinpart: false,
             hover_anim: new_row_anim(),
@@ -1033,6 +1229,7 @@ impl App {
                     }
                 }
                 self.input = s;
+                self.maybe_send_typing(Instant::now());
                 Task::none()
             }
             Message::SendMessage => {
@@ -1045,6 +1242,7 @@ impl App {
                 self.input.clear();
                 self.history_cursor = None;
                 self.history_draft.clear();
+                self.send_typing_done();
 
                 if let Some(cmd) = text.strip_prefix('/') {
                     self.handle_command(cmd);
@@ -1077,7 +1275,7 @@ impl App {
                         inserted_at: now,
                         mono_secs: now.elapsed().as_secs(),
                         kind: MsgKind::Chat,
-                        msgid: None,
+                        msgid: None, reactions: HashMap::new(),
                     });
                     self.now = now;
                     return fetch;
@@ -1786,6 +1984,9 @@ impl App {
             "ban" => self.cmd_ban(true, rest, now),
             "unban" => self.cmd_ban(false, rest, now),
             "invite" => self.cmd_invite(rest, now),
+            "history" => self.cmd_history(now),
+            "delete" | "redact" => self.cmd_delete(rest, now),
+            "react" => self.cmd_react(rest, now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -1830,9 +2031,16 @@ impl App {
                 .push(system_line("usage: /join #channel", now));
             return;
         }
-        let channel = if target.starts_with('#') || target.starts_with('&') {
+        let chantypes = self.active_chantypes();
+        let starts_with_chantype = target
+            .chars()
+            .next()
+            .map(|c| chantypes.contains(c))
+            .unwrap_or(false);
+        let channel = if starts_with_chantype {
             target.to_string()
         } else {
+            // Fall back to '#' as the default channel prefix.
             format!("#{target}")
         };
         if !self.send_out(Outgoing::Join(channel.clone()), now) {
@@ -2090,8 +2298,8 @@ impl App {
         self.send_out(Outgoing::Mode { target, modes, args }, now);
     }
 
-    // Bulk MODE +o/-o/+v/-v helper. Chunks nicks in groups of 4 to respect
-    // the smallest common MODES= limit advertised by IRCds.
+    // Bulk MODE +o/-o/+v/-v helper. Chunks nicks per the server's MODES=
+    // ISUPPORT advertisement (default 3 when missing, matching RFC2812).
     fn cmd_channel_priv(&mut self, sign: &str, flag: &str, rest: &str, now: Instant) {
         let label = format!("{sign}{flag}");
         let Some(channel) = self.current_channel_for_op(&label, now) else { return };
@@ -2102,7 +2310,13 @@ impl App {
                 .push(system_line(&format!("usage: /{label} <nick> [nick...]"), now));
             return;
         }
-        for chunk in nicks.chunks(4) {
+        let limit = self
+            .active_net()
+            .and_then(|n| n.isupport.modes)
+            .map(|n| n as usize)
+            .filter(|n| *n > 0)
+            .unwrap_or(3);
+        for chunk in nicks.chunks(limit) {
             let modes = format!("{sign}{}", flag.repeat(chunk.len()));
             let args: Vec<String> = chunk.to_vec();
             if !self.send_out(
@@ -2161,6 +2375,127 @@ impl App {
             }
         };
         self.send_out(Outgoing::Invite { nick, channel }, now);
+    }
+
+    fn cmd_delete(&mut self, rest: &str, now: Instant) {
+        let Some(ch) = self.channels.get(self.selected) else { return };
+        if ch.name.starts_with('&') {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("can't /delete in the status buffer", now));
+            return;
+        }
+        let net_id = ch.network_id;
+        let target = ch.name.clone();
+        let my_nick = self
+            .net(net_id)
+            .map(|n| n.cfg.nickname.clone())
+            .unwrap_or_default();
+        // Resolve msgid: explicit arg, or last own message with a msgid.
+        let arg = rest.split_whitespace().next().unwrap_or("");
+        let msgid = if !arg.is_empty() {
+            arg.to_string()
+        } else {
+            match self.channels[self.selected]
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.nick == my_nick && m.msgid.is_some())
+                .and_then(|m| m.msgid.clone())
+            {
+                Some(id) => id,
+                None => {
+                    self.channels[self.selected].messages.push(system_line(
+                        "no recent message of yours has a msgid (need echo-message or a passed argument)",
+                        now,
+                    ));
+                    return;
+                }
+            }
+        };
+        if !self.send_out(
+            Outgoing::Redact {
+                target,
+                msgid,
+                reason: None,
+            },
+            now,
+        ) {
+            return;
+        }
+    }
+
+    fn cmd_react(&mut self, rest: &str, now: Instant) {
+        let Some(ch) = self.channels.get(self.selected) else { return };
+        if ch.name.starts_with('&') {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("can't /react in the status buffer", now));
+            return;
+        }
+        let net_id = ch.network_id;
+        let target = ch.name.clone();
+        let mut parts = rest.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        let second = parts.next().unwrap_or("");
+        if first.is_empty() {
+            self.channels[self.selected].messages.push(system_line(
+                "usage: /react <emoji>  or  /react <msgid> <emoji>",
+                now,
+            ));
+            return;
+        }
+        let (msgid, emoji) = if second.is_empty() {
+            // No msgid: react to the most recent message (any sender) with a msgid.
+            let last_id = self.channels[self.selected]
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| m.msgid.clone());
+            match last_id {
+                Some(id) => (id, first.to_string()),
+                None => {
+                    self.channels[self.selected].messages.push(system_line(
+                        "no recent message has a msgid to react to",
+                        now,
+                    ));
+                    return;
+                }
+            }
+        } else {
+            (first.to_string(), second.to_string())
+        };
+        let _ = net_id; // silence unused
+        if !self.send_out(
+            Outgoing::React { target, msgid, emoji },
+            now,
+        ) {
+            return;
+        }
+    }
+
+    fn cmd_history(&mut self, now: Instant) {
+        // Window: last 7 days. The chathistory spec uses ISO8601 timestamps,
+        // and `from < to` is required.
+        let to_ts = chatlog::iso_now();
+        let from_ts = chatlog::iso_minus_days(7);
+        if !self.send_out(
+            Outgoing::ChatHistoryTargets {
+                from_ts: from_ts.clone(),
+                to_ts: to_ts.clone(),
+                limit: 50,
+            },
+            now,
+        ) {
+            return;
+        }
+        self.push_status_in(
+            self.channels[self.selected].network_id,
+            system_line(
+                &format!("→ querying chathistory targets [{from_ts} .. {to_ts}]"),
+                now,
+            ),
+        );
     }
 
     fn cmd_close(&mut self, now: Instant) {
@@ -2227,7 +2562,7 @@ impl App {
             inserted_at: now,
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Action,
-            msgid: None,
+            msgid: None, reactions: HashMap::new(),
         });
     }
 
@@ -2260,7 +2595,7 @@ impl App {
             inserted_at: now,
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Chat,
-            msgid: None,
+            msgid: None, reactions: HashMap::new(),
         });
         self.set_selected(idx);
     }
@@ -2627,6 +2962,12 @@ impl App {
                 let is_self = nick == my_nick;
                 let is_dm = !my_nick.is_empty() && target == my_nick;
                 let bucket = if is_dm { nick.clone() } else { target.clone() };
+                if is_self
+                    && !is_backlog
+                    && self.dedupe_self_echo(network_id, &bucket, &body, MsgKind::Chat, &meta)
+                {
+                    return Task::none();
+                }
                 let viewing = self.is_actively_viewing(network_id, &bucket);
                 let is_highlight = is_dm || self.is_highlight(&body, &my_nick);
                 if !is_backlog && !is_self && !viewing {
@@ -2680,6 +3021,12 @@ impl App {
                 let is_self = nick == my_nick;
                 let is_dm = !my_nick.is_empty() && target == my_nick;
                 let bucket = if is_dm { nick.clone() } else { target.clone() };
+                if is_self
+                    && !is_backlog
+                    && self.dedupe_self_echo(network_id, &bucket, &body, MsgKind::Action, &meta)
+                {
+                    return Task::none();
+                }
                 let viewing = self.is_actively_viewing(network_id, &bucket);
                 let is_highlight = is_dm || self.is_highlight(&body, &my_nick);
                 if !is_backlog && !is_self && !viewing {
@@ -2732,6 +3079,9 @@ impl App {
                     }
                     if let Some(pos) = ch.members.iter().position(|n| n == &old) {
                         ch.members[pos] = new.clone();
+                        if let Some(meta) = ch.member_meta.remove(&old) {
+                            ch.member_meta.insert(new.clone(), meta);
+                        }
                         let body = if is_self {
                             format!("you are now {new}")
                         } else {
@@ -2745,10 +3095,26 @@ impl App {
                 }
                 Task::none()
             }
-            IrcEvent::UserJoined { channel, nick, meta } => {
+            IrcEvent::UserJoined { channel, nick, userhost, account, realname: _, meta } => {
                 let idx = self.ensure_channel_in(network_id, &channel);
                 if !self.channels[idx].members.iter().any(|n| n == &nick) {
                     self.channels[idx].members.push(nick.clone());
+                }
+                // Track whatever extra fields we can; prefixes will arrive
+                // later via MODE / NAMES updates if applicable.
+                let entry = self.channels[idx]
+                    .member_meta
+                    .entry(nick.clone())
+                    .or_default();
+                if userhost.is_some() {
+                    entry.userhost = userhost;
+                }
+                // Stash extended-join account so it's available even if we
+                // never see an account-notify or `account` tag later.
+                if let (Some(net), Some(acc)) =
+                    (self.net_mut(network_id), account.as_ref())
+                {
+                    net.accounts.insert(nick.to_ascii_lowercase(), acc.clone());
                 }
                 if meta.batch.is_none() {
                     chatlog::append(
@@ -2756,9 +3122,15 @@ impl App {
                         &channel,
                         &format!("{}  -- {} joined", chatlog::iso_now(), nick),
                     );
+                    let body = match account.as_deref() {
+                        Some(a) if !a.eq_ignore_ascii_case(&nick) => {
+                            format!("→ {nick} ({a}) joined")
+                        }
+                        _ => format!("→ {nick} joined"),
+                    };
                     self.channels[idx]
                         .messages
-                        .push(joinpart_line(&format!("→ {nick} joined"), now));
+                        .push(joinpart_line(&body, now));
                 }
                 let my_nick = self
                     .net(network_id)
@@ -2769,9 +3141,109 @@ impl App {
                 }
                 Task::none()
             }
+            IrcEvent::AccountChanged { nick, account, meta: _ } => {
+                let key = nick.to_ascii_lowercase();
+                if let Some(net) = self.net_mut(network_id) {
+                    match &account {
+                        Some(a) => { net.accounts.insert(key, a.clone()); }
+                        None => { net.accounts.remove(&key); }
+                    }
+                }
+                let body = match account.as_deref() {
+                    Some(a) => format!("-- {nick} is now logged in as {a}"),
+                    None => format!("-- {nick} logged out of services"),
+                };
+                self.push_to_channels_with(network_id, &nick, &body, now);
+                Task::none()
+            }
+            IrcEvent::AwayChanged { nick, message, meta: _ } => {
+                let key = nick.to_ascii_lowercase();
+                if let Some(net) = self.net_mut(network_id) {
+                    if message.is_some() {
+                        net.away_nicks.insert(key);
+                    } else {
+                        net.away_nicks.remove(&key);
+                    }
+                }
+                Task::none()
+            }
+            IrcEvent::HostChanged { nick, ident, host, meta: _ } => {
+                let body = format!("-- {nick} is now {ident}@{host}");
+                self.push_to_channels_with(network_id, &nick, &body, now);
+                Task::none()
+            }
+            IrcEvent::ISupport(snapshot) => {
+                if let Some(net) = self.net_mut(network_id) {
+                    net.isupport = snapshot;
+                }
+                Task::none()
+            }
+            IrcEvent::TypingChanged { target, nick, state } => {
+                if self.is_ignored(&nick) {
+                    return Task::none();
+                }
+                let bucket = self.bucket_for_target(network_id, &target, &nick);
+                let key = (network_id, bucket, nick);
+                match state {
+                    irc_worker::TypingState::Active => {
+                        self.typing_observed.insert(key, now);
+                    }
+                    _ => {
+                        self.typing_observed.remove(&key);
+                    }
+                }
+                Task::none()
+            }
+            IrcEvent::ReadMarker { target, timestamp } => {
+                let key = (network_id, target);
+                if let Some(ts) = timestamp {
+                    self.read_markers.insert(key, ts);
+                } else {
+                    self.read_markers.remove(&key);
+                }
+                Task::none()
+            }
+            IrcEvent::Redacted { target, msgid, by_nick, reason } => {
+                let bucket = self.bucket_for_target(network_id, &target, &by_nick);
+                if let Some(idx) = self.find_channel_in(network_id, &bucket) {
+                    if let Some(entry) = self.channels[idx]
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.msgid.as_deref() == Some(msgid.as_str()))
+                    {
+                        let suffix = match reason.as_deref() {
+                            Some(r) if !r.is_empty() => format!(" ({r})"),
+                            _ => String::new(),
+                        };
+                        entry.body = format!("[deleted by {by_nick}{suffix}]");
+                        entry.kind = MsgKind::System;
+                    }
+                }
+                Task::none()
+            }
+            IrcEvent::Reaction { target, target_msgid, nick, emoji } => {
+                if self.is_ignored(&nick) {
+                    return Task::none();
+                }
+                let bucket = self.bucket_for_target(network_id, &target, &nick);
+                if let Some(idx) = self.find_channel_in(network_id, &bucket) {
+                    if let Some(entry) = self.channels[idx]
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.msgid.as_deref() == Some(target_msgid.as_str()))
+                    {
+                        entry.reactions
+                            .entry(emoji)
+                            .or_default()
+                            .insert(nick);
+                    }
+                }
+                Task::none()
+            }
             IrcEvent::UserLeft { channel, nick, meta } => {
                 let idx = self.ensure_channel_in(network_id, &channel);
                 self.channels[idx].members.retain(|n| n != &nick);
+                self.channels[idx].member_meta.remove(&nick);
                 if meta.batch.is_none() {
                     chatlog::append(
                         &net_name,
@@ -2784,12 +3256,19 @@ impl App {
                 }
                 Task::none()
             }
-            IrcEvent::Names { channel, nicks } => {
+            IrcEvent::Names { channel, members } => {
                 let idx = self.ensure_channel_in(network_id, &channel);
-                for n in nicks {
-                    if !self.channels[idx].members.iter().any(|m| m == &n) {
-                        self.channels[idx].members.push(n);
+                for entry in members {
+                    if !self.channels[idx].members.iter().any(|m| m == &entry.nick) {
+                        self.channels[idx].members.push(entry.nick.clone());
                     }
+                    self.channels[idx].member_meta.insert(
+                        entry.nick.clone(),
+                        MemberMeta {
+                            prefixes: entry.prefixes,
+                            userhost: entry.userhost,
+                        },
+                    );
                 }
                 Task::none()
             }
@@ -2849,6 +3328,35 @@ impl App {
         if self.window_focused {
             self.channels[i].has_unread = false;
             self.channels[i].has_mention = false;
+            self.send_read_marker();
+        }
+    }
+
+    // Push a MARKREAD for the currently-selected target with the timestamp
+    // of the most recent message in the buffer. No-op when the server
+    // hasn't ACKed `draft/read-marker` or when in &status.
+    fn send_read_marker(&mut self) {
+        let Some(ch) = self.channels.get(self.selected) else { return };
+        if ch.name.starts_with('&') {
+            return;
+        }
+        let supported = self
+            .net(ch.network_id)
+            .is_some_and(|n| n.caps_acked.contains("draft/read-marker"));
+        if !supported {
+            return;
+        }
+        // Use the latest message's mono_secs for an approximate ISO
+        // timestamp. Without a server-time on every msg we can only
+        // approximate with our own clock.
+        let timestamp = chatlog::iso_now();
+        let net_id = ch.network_id;
+        let target = ch.name.clone();
+        if let Some(tx) = self.net_mut(net_id).and_then(|n| n.outgoing.as_mut()) {
+            let _ = tx.try_send(Outgoing::MarkRead {
+                target,
+                timestamp: Some(timestamp),
+            });
         }
     }
 
@@ -2898,6 +3406,78 @@ impl App {
         !nick.is_empty() && self.ignored_nicks.contains(&nick.to_ascii_lowercase())
     }
 
+    // When `echo-message` is acked, the server echoes our own PRIVMSGs
+    // back. We've already inserted them locally on send, so look back a
+    // few entries and graft the server-assigned msgid onto the local row,
+    // then tell the caller to skip the duplicate insert.
+    //
+    // Returns true if the echo was deduped (drop it) and false if the
+    // event should be inserted normally (e.g. multi-device: another client
+    // sent the message and we're seeing it for the first time).
+    fn dedupe_self_echo(
+        &mut self,
+        network_id: NetworkId,
+        bucket: &str,
+        body: &str,
+        kind: MsgKind,
+        meta: &irc_worker::MsgMeta,
+    ) -> bool {
+        let Some(net) = self.net(network_id) else { return false };
+        if !net.caps_acked.contains("echo-message") {
+            return false;
+        }
+        let my_nick = net.cfg.nickname.clone();
+        if my_nick.is_empty() {
+            return false;
+        }
+        let Some(idx) = self.find_channel_in(network_id, bucket) else { return false };
+        let messages = &mut self.channels[idx].messages;
+        let scan = messages.len().min(30);
+        let start = messages.len() - scan;
+        for entry in messages[start..].iter_mut().rev() {
+            if entry.nick == my_nick
+                && entry.kind == kind
+                && entry.msgid.is_none()
+                && entry.body == body
+            {
+                entry.msgid = meta.msgid.clone();
+                return true;
+            }
+        }
+        false
+    }
+
+    // Channel-name prefix characters advertised by the active server via
+    // ISUPPORT (`CHANTYPES=`). Falls back to `#&` per RFC2812.
+    fn active_chantypes(&self) -> String {
+        let from_isupport = self
+            .active_net()
+            .map(|n| n.isupport.chantypes.clone())
+            .filter(|s| !s.is_empty());
+        from_isupport.unwrap_or_else(|| "#&".into())
+    }
+
+    // Returns the highest-priority channel prefix character for a nick
+    // in the currently-selected channel (e.g. `@`, `+`), or None.
+    fn member_prefix(&self, nick: &str) -> Option<char> {
+        let ch = self.channels.get(self.selected)?;
+        ch.member_meta
+            .get(nick)
+            .and_then(|m| m.prefixes.chars().next())
+    }
+
+    // True when the nick is marked away on the network owning the
+    // currently-selected channel. Used to fade entries in the member list.
+    fn is_nick_away(&self, nick: &str) -> bool {
+        if nick.is_empty() {
+            return false;
+        }
+        let Some(ch) = self.channels.get(self.selected) else { return false };
+        let key = nick.to_ascii_lowercase();
+        self.net(ch.network_id)
+            .is_some_and(|n| n.away_nicks.contains(&key))
+    }
+
     fn is_highlight(&self, body: &str, my_nick: &str) -> bool {
         if !my_nick.is_empty() && mentions(body, my_nick) {
             return true;
@@ -2921,6 +3501,31 @@ impl App {
     fn push_status_in(&mut self, network_id: NetworkId, msg: ChatMessage) {
         let idx = self.ensure_channel_in(network_id, "&status");
         self.channels[idx].messages.push(msg);
+    }
+
+    // Emit a system line in every channel on `network_id` where `nick`
+    // is a member, plus the network's &status buffer as a catch-all.
+    // Used for ACCOUNT / CHGHOST broadcasts that affect a user globally.
+    fn push_to_channels_with(
+        &mut self,
+        network_id: NetworkId,
+        nick: &str,
+        body: &str,
+        now: Instant,
+    ) {
+        let mut hit_any = false;
+        for ch in self.channels.iter_mut() {
+            if ch.network_id != network_id {
+                continue;
+            }
+            if ch.members.iter().any(|n| n == nick) {
+                ch.messages.push(system_line(body, now));
+                hit_any = true;
+            }
+        }
+        if !hit_any {
+            self.push_status_in(network_id, system_line(body, now));
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -4050,7 +4655,20 @@ matched on word boundaries.",
         )
         .padding(pad(tok::S2, tok::S4, tok::S3, tok::S4));
 
-        container(column![header, msg_area, input])
+        let typing_bar: Element<Message> = match self.typing_text() {
+            Some(body) => container(
+                text(body)
+                    .size(sz(11.0))
+                    .color(tok::text_faint())
+                    .font(regular()),
+            )
+            .padding(pad(0.0, tok::S4 as f32, tok::S1 as f32, tok::S4 as f32))
+            .width(Fill)
+            .into(),
+            None => sp(0, 0).into(),
+        };
+
+        container(column![header, msg_area, typing_bar, input])
             .width(Fill)
             .height(Fill)
             .style(|_| container::Style {
@@ -4109,6 +4727,9 @@ matched on word boundaries.",
             };
 
             out.push(self.message_line(m, grouped, dim_level, baseline));
+            if !m.reactions.is_empty() {
+                out.push(reactions_row(&m.reactions));
+            }
 
             prev_nick = Some(m.nick.as_str());
             prev_secs = m.mono_secs;
@@ -4321,17 +4942,42 @@ matched on word boundaries.",
     fn member_row(&self, i: usize, nick: &str) -> Element<'_, Message> {
         let hovered = self.hovered_member == Some(i);
         let nick_owned = nick.to_string();
+        let away = self.is_nick_away(nick);
+        let prefix = self.member_prefix(nick);
+
+        // Away users: fade both the colored dot and the nick text.
+        // Prefix takes precedence on the dot color (ops greenish, voice cyan).
+        let dot_color = if away {
+            Color::from_rgb(0.55, 0.6, 0.6)
+        } else {
+            match prefix {
+                Some('~') | Some('&') | Some('@') => Color::from_rgb(0.4, 0.8, 0.55),
+                Some('%') => Color::from_rgb(0.5, 0.7, 0.85),
+                Some('+') => Color::from_rgb(0.55, 0.75, 0.95),
+                _ => Color::from_rgb(0.55, 0.6, 0.6),
+            }
+        };
+        let mut text_color = nick_color(nick);
+        if away {
+            text_color.a *= 0.45;
+        }
+
+        // Render the highest-priority prefix as a leading glyph.
+        let label = match prefix {
+            Some(p) => format!("{p}{}", truncate(nick, 14)),
+            None => truncate(nick, 14).to_string(),
+        };
 
         let row_content = row![
-            container(sp(6, 6)).style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgb(0.4, 0.8, 0.55))),
+            container(sp(6, 6)).style(move |_| container::Style {
+                background: Some(Background::Color(dot_color)),
                 border: Border { radius: 3.0.into(), ..Default::default() },
                 ..Default::default()
             }),
-            text(truncate(nick, 14))
+            text(label)
                 .size(sz(12.0))
                 .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(sz(14.0))))
-                .color(nick_color(nick))
+                .color(text_color)
                 .font(if hovered { medium() } else { regular() })
                 .wrapping(iced::widget::text::Wrapping::None),
         ]

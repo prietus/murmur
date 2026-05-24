@@ -8,6 +8,47 @@ Murmur is a quiet client. Joins, parts, and noise fade into the background; conv
 
 Alpha. Tested on macOS. Linux/Windows builds produced by CI but not heavily exercised yet.
 
+## IRCv3 support
+
+Murmur negotiates the following capabilities at connect time:
+
+**Identity & presence**
+- `account-tag` — every message carries the sender's services account
+- `extended-join` — JOIN lines show services account when present
+- `account-notify` — see when other users log in/out of NickServ
+- `away-notify` — away users render dimmed in the member list
+- `chghost` — host/ident changes shown in place, no fake quit/join
+- `echo-message` — your own messages get a server-assigned `msgid` for editing/reacting
+
+**Member list enrichment**
+- `multi-prefix` — every channel prefix shown (`@+nick`, not just the highest)
+- `userhost-in-names` — `ident@host` captured from NAMES for tooltips/whois
+
+**Protocol plumbing**
+- `message-tags` + `server-time` + `batch` — IRCv3 message metadata + tagged batches
+- `invite-notify` — channel ops see who's being invited
+- `labeled-response` — response correlation for parallel commands
+- `sts` — Strict Transport Security, persists per host; forces TLS+port on next connect
+
+**Authentication**
+- SASL `PLAIN` (password)
+- SASL `EXTERNAL` (CertFP — auto-selected when `client_cert_path` is set)
+
+**History & catch-up**
+- `draft/chathistory` — server-side scrollback on channel attach (`LATEST`)
+- `draft/chathistory` `TARGETS` subcommand — `/history` shows active conversations
+- IRCv3 standard replies (`FAIL` / `WARN` / `NOTE`) — rendered uniformly in the status buffer
+- `RPL_ISUPPORT` (005) parser — uses `MODES=` for op-bulk chunking, `CHANTYPES=` for `/join` validation
+
+**Modern drafts**
+- `draft/typing` — "X is typing…" indicator below the input; sends `+typing=active` while you type
+- `draft/multiline` — receives BATCH multiline as a single message with line breaks
+- `draft/read-marker` — sends `MARKREAD` when you focus a channel
+- `draft/message-redaction` — `/delete` removes your last message (or `/delete <msgid>`); incoming REDACTs render as tombstones
+- `+draft/react` — `/react <emoji>` reacts to the latest message; reactions render as grouped badges
+
+Server support varies — Ergo and Soju cover the most ground; Libera supports identity/presence/history but not the editing/redaction drafts.
+
 ## Build from source
 
 ```sh
