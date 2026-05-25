@@ -20,6 +20,7 @@ Murmur attempts to establish the following IRCv3 capabilities with the server wh
 - `away-notify` — away users render dimmed in the member list
 - `chghost` — host/ident changes shown in place, no fake quit/join
 - `echo-message` — your own messages get a server-assigned `msgid` for editing/reacting
+- `setname` — change your realname mid-session with `/setname <new realname>`
 
 **Member list enrichment**
 
@@ -30,6 +31,7 @@ Murmur attempts to establish the following IRCv3 capabilities with the server wh
 
 - `message-tags` + `server-time` + `batch` — IRCv3 message metadata + tagged batches
 - `invite-notify` — channel ops see who's being invited
+- `cap-notify` — react to `CAP NEW` / `CAP DEL` mid-session (bouncer network attach/detach)
 - `labeled-response` — response correlation for parallel commands
 - `sts` — Strict Transport Security, persists per host; forces TLS+port on next connect
 
@@ -37,11 +39,13 @@ Murmur attempts to establish the following IRCv3 capabilities with the server wh
 
 - SASL `PLAIN` (password)
 - SASL `EXTERNAL` (CertFP — auto-selected when `client_cert_path` is set)
+- `draft/sasl-ir` — initial response on the first `AUTHENTICATE` line, skips the `+` challenge roundtrip
 
 **History & catch-up**
 
 - `draft/chathistory` — server-side scrollback on channel attach (`LATEST`)
 - `draft/chathistory` `TARGETS` subcommand — `/history` shows active conversations
+- `draft/event-playback` — soju/bouncer replays joins/parts/nicks alongside PRIVMSGs in chathistory
 - IRCv3 standard replies (`FAIL` / `WARN` / `NOTE`) — rendered uniformly in the status buffer
 - `RPL_ISUPPORT` (005) parser — uses `MODES=` for op-bulk chunking, `CHANTYPES=` for `/join` validation
 

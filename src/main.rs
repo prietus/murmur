@@ -93,9 +93,21 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/history", "list targets with chathistory activity (last 7 days, max 50)", false),
     ("/delete", "delete your last message — or /delete <msgid> for a specific one", false),
     ("/react", "react with emoji: /react <emoji> (on your last received msg) or /react <msgid> <emoji>", true),
+    ("/setname", "change your realname mid-session (IRCv3 setname): /setname <new realname>", true),
 ];
 
 fn main() -> iced::Result {
+    // macOS: pin the application identity used by notify-rust so its
+    // underlying mac-notification-sys does not fall back to an in-process
+    // AppleScript bundle-id lookup, which on unsigned Mach-O binaries can
+    // pop a Script Editor / "open as script" prompt on the first call.
+    // Outside a real .app bundle this is a no-op cosmetically but still
+    // skips the AppleScript path.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = notify_rust::set_application("us.priet.murmur");
+    }
+
     if let LoadResult::Loaded(cfg) = config::load() {
         if let Some(fam) = cfg.font_family.as_deref().filter(|s| !s.is_empty()) {
             let leaked: &'static str = Box::leak(fam.to_string().into_boxed_str());
@@ -2186,6 +2198,7 @@ impl App {
             "history" => self.cmd_history(now),
             "delete" | "redact" => self.cmd_delete(rest, now),
             "react" => self.cmd_react(rest, now),
+            "setname" => self.cmd_setname(rest, now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -2363,6 +2376,28 @@ impl App {
         self.channels[self.selected]
             .messages
             .push(system_line("back — away cleared", now));
+    }
+
+    fn cmd_setname(&mut self, rest: &str, now: Instant) {
+        let new = rest.trim();
+        if new.is_empty() {
+            self.channels[self.selected]
+                .messages
+                .push(system_line("usage: /setname <new realname>", now));
+            return;
+        }
+        let net_id = self.channels[self.selected].network_id;
+        let supports = self
+            .net(net_id)
+            .is_some_and(|n| n.caps_acked.contains("setname"));
+        if !supports {
+            self.channels[self.selected].messages.push(system_line(
+                "server doesn't advertise the `setname` capability",
+                now,
+            ));
+            return;
+        }
+        self.send_out(Outgoing::SetName(new.to_string()), now);
     }
 
     fn cmd_whois(&mut self, rest: &str, now: Instant) {
@@ -4950,7 +4985,8 @@ matched on word boundaries.",
                 .width(Fill),
         )
         .height(Fill)
-        .width(Fill);
+        .width(Fill)
+        .anchor_bottom();
 
         let placeholder = compose_placeholder(&ch.name);
         let has_text = !self.input.trim().is_empty();
@@ -5589,11 +5625,18 @@ async fn fetch_media(url: String) -> FetchedMedia {
         let has_og_or_twitter = meta
             .keys()
             .any(|k| k.starts_with("og:") || k.starts_with("twitter:"));
+        let has_title = meta
+            .get("title")
+            .map(|s| !collapse_ws(s).is_empty())
+            .unwrap_or(false);
 
         // Image-wrapper pages (paste sites etc.) embed an <img> but ship
-        // no OpenGraph/Twitter metadata. Promote those directly to a
-        // full image preview instead of a sparse link card.
-        if !has_og_or_twitter {
+        // no OpenGraph/Twitter metadata and no meaningful <title>. Promote
+        // those directly to a full image preview instead of a sparse link
+        // card. Real pages with a <title> (wikis, blogs without og:) get
+        // a link card instead, so we don't hijack the preview with their
+        // logo or footer image.
+        if !has_og_or_twitter && !has_title {
             if let Some(img_src) = extract_first_img_src(&html) {
                 let img_url = resolve_url(&url, &img_src);
                 if let Ok((handle, w, h)) = fetch_image(&client, &img_url).await {

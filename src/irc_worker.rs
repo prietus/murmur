@@ -21,10 +21,12 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "away-notify",
     "chghost",
     "echo-message",
+    "setname",
     // Tier-2 NAMES enrichment:
     "multi-prefix",
     "userhost-in-names",
     // Tier-2 protocol plumbing:
+    "cap-notify",
     "labeled-response",
     "sts",
     // Tier-3 drafts:
@@ -32,6 +34,8 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "draft/typing",
     "draft/read-marker",
     "draft/message-redaction",
+    "draft/event-playback",
+    "draft/sasl-ir",
 ];
 
 /// Subset of RPL_ISUPPORT (005) tokens that we actually act on. Accumulated
@@ -139,6 +143,9 @@ pub enum Outgoing {
     Redact { target: String, msgid: String, reason: Option<String> },
     /// Send a `+draft/reply=<msgid>` TAGMSG carrying an emoji reaction.
     React { target: String, msgid: String, emoji: String },
+    /// `SETNAME :<new realname>` (IRCv3 setname cap). Changes realname
+    /// mid-session without reconnecting.
+    SetName(String),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -336,6 +343,19 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
             tokio::select! {
                 incoming = stream.next() => match incoming {
                     Some(Ok(msg)) => {
+                        if auth_phase == AuthPhase::Done {
+                            // `cap-notify` push: handle CAP NEW/ACK/DEL that
+                            // arrive mid-session (typically from bouncers).
+                            if let Some(updated) =
+                                handle_cap_notify(&msg, &sender, &mut cap_state)
+                            {
+                                let _ = out.send(Event::CapsAcked(updated)).await;
+                            }
+                            // Drop CAP wire chatter from the chat view.
+                            if matches!(&msg.command, Command::CAP(..)) {
+                                continue;
+                            }
+                        }
                         if auth_phase != AuthPhase::Done {
                             match handle_auth_msg(
                                 &msg, &sender, &mut auth_phase, auth_mode,
@@ -541,6 +561,12 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                             }
                             let _ = sender.send(Command::Raw("REDACT".into(), argv));
                         }
+                        Some(Outgoing::SetName(realname)) => {
+                            let _ = sender.send(Command::Raw(
+                                "SETNAME".into(),
+                                vec![realname],
+                            ));
+                        }
                         Some(Outgoing::React { target, msgid, emoji }) => {
                             // Reactions piggyback on TAGMSG with +draft/reply
                             // pointing at the target msgid; body lives in the
@@ -567,6 +593,74 @@ enum AuthOutcome {
     NeedIdentify,
     Done,
     Failed(String),
+}
+
+// Once auth is complete, the server may push CAP NEW / CAP DEL via the
+// `cap-notify` capability (soju does this when a bouncer network attaches
+// or detaches, exposing or hiding its caps). We auto-REQ any newly-offered
+// caps in our wanted set and track post-auth ACKs / DELs in `caps.acked`.
+//
+// Returns `Some(snapshot)` of the updated acked set if it changed, so the
+// caller can push an updated `Event::CapsAcked` to the App.
+fn handle_cap_notify(
+    msg: &Message,
+    sender: &Sender,
+    caps: &mut CapState,
+) -> Option<Vec<String>> {
+    let Command::CAP(_, sub, third, fourth) = &msg.command else {
+        return None;
+    };
+    let listed = fourth.as_deref().or(third.as_deref()).unwrap_or("");
+    match *sub {
+        CapSubCommand::NEW => {
+            let mut to_req: Vec<String> = Vec::new();
+            for token in listed.split_whitespace() {
+                let (name_raw, value) = match token.split_once('=') {
+                    Some((n, v)) => (n, Some(v.to_string())),
+                    None => (token, None),
+                };
+                let name = name_raw.to_ascii_lowercase();
+                caps.available.insert(name.clone());
+                if let Some(v) = value {
+                    caps.values.insert(name.clone(), v);
+                }
+                if WANT_EXTRA_CAPS.contains(&name.as_str()) && !caps.acked.contains(&name) {
+                    to_req.push(name);
+                }
+            }
+            if !to_req.is_empty() {
+                let _ = sender.send(Command::CAP(
+                    None,
+                    CapSubCommand::REQ,
+                    None,
+                    Some(to_req.join(" ")),
+                ));
+            }
+            None
+        }
+        CapSubCommand::ACK => {
+            let mut changed = false;
+            for cap in listed.split_whitespace() {
+                if caps.acked.insert(cap.to_ascii_lowercase()) {
+                    changed = true;
+                }
+            }
+            changed.then(|| caps.acked.iter().cloned().collect())
+        }
+        CapSubCommand::DEL => {
+            let mut changed = false;
+            for cap in listed.split_whitespace() {
+                let lower = cap.to_ascii_lowercase();
+                caps.available.remove(&lower);
+                caps.values.remove(&lower);
+                if caps.acked.remove(&lower) {
+                    changed = true;
+                }
+            }
+            changed.then(|| caps.acked.iter().cloned().collect())
+        }
+        _ => None,
+    }
 }
 
 fn handle_auth_msg(
@@ -672,10 +766,40 @@ fn handle_auth_msg(
                     AuthMode::SaslExternal => "EXTERNAL",
                     _ => "PLAIN",
                 };
-                if let Err(e) = sender.send(Command::AUTHENTICATE(mech.to_string())) {
-                    return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+                // With `draft/sasl-ir` we can attach the initial response on
+                // the first AUTHENTICATE line, skipping the server's `+`
+                // challenge entirely. Fall back to the classic two-step
+                // flow if the payload would exceed one line (>400 bytes)
+                // since the IR variant can't be chunked.
+                let payload = match mode {
+                    AuthMode::SaslExternal => "+".to_string(),
+                    _ => {
+                        let user = cfg.sasl_user();
+                        let pass = cfg.sasl_password.as_deref().unwrap_or("");
+                        let raw = build_plain_payload(user, pass);
+                        if raw.is_empty() {
+                            "+".to_string()
+                        } else {
+                            b64_encode(&raw)
+                        }
+                    }
+                };
+                let use_ir =
+                    caps.acked.contains("draft/sasl-ir") && payload.len() < 400;
+                if use_ir {
+                    if let Err(e) = sender.send(Command::Raw(
+                        "AUTHENTICATE".into(),
+                        vec![mech.to_string(), payload],
+                    )) {
+                        return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+                    }
+                    *phase = AuthPhase::AwaitingResult;
+                } else {
+                    if let Err(e) = sender.send(Command::AUTHENTICATE(mech.to_string())) {
+                        return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+                    }
+                    *phase = AuthPhase::AwaitingChallenge;
                 }
-                *phase = AuthPhase::AwaitingChallenge;
                 AuthOutcome::Pending
             } else {
                 AuthOutcome::NeedIdentify
@@ -1186,6 +1310,16 @@ fn translate(
                     .skip(1)
                     .find_map(|s| s.strip_prefix("timestamp=").map(str::to_string));
                 return vec![Event::ReadMarker { target, timestamp }];
+            }
+            // SETNAME: `:nick!user@host SETNAME :<new realname>`. Surface
+            // realname changes as a one-line notice in &status.
+            if cmd.eq_ignore_ascii_case("SETNAME") && !args.is_empty() {
+                let new = args.last().cloned().unwrap_or_default();
+                return vec![Event::Notice {
+                    from: "*".into(),
+                    text: format!("{nick} updated realname → {new}"),
+                    meta,
+                }];
             }
             // REDACT: `:nick REDACT <target> <msgid> [:reason]`
             if cmd.eq_ignore_ascii_case("REDACT") && args.len() >= 2 {
