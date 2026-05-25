@@ -2,7 +2,7 @@
 
 [murmur.priet.us](https://murmur.priet.us) — A native, opinionated IRC client. Built in Rust with [iced](https://iced.rs).
 
-Murmur is a quiet client that puts the conversation into the foreground. Joins, parts, and all other possible noise fade to the background instead. Murmur is subtle by default, but full of features. It provides a special focus mode (`\dimm`), inline media previews, tab-completion, a command palette (⌘K), a built-in emoji picker, per-channel logs, and supports SASL PLAIN / EXTERNAL (CertFP).
+Murmur is a quiet client. Joins, parts, and noise fade into the background; conversation gets the foreground. Subtle by default, with `/dimm` for focus mode, inline media previews, tab-complete, command palette (⌘K), built-in emoji picker, per-channel logs, and SASL PLAIN / EXTERNAL (CertFP).
 
 ## Status
 
@@ -14,10 +14,10 @@ Murmur attempts to establish the following IRCv3 capabilities with the server wh
 
 **Identity & presence**
 
-- `account-tag` — causes the server to add a message tag containing the command sender’s services account
+- `account-tag` — every message carries the sender's services account
 - `extended-join` — JOIN lines show services account when present
 - `account-notify` — see when other users log in/out of NickServ
-- `away-notify` — away users grayed out in the member list
+- `away-notify` — away users render dimmed in the member list
 - `chghost` — host/ident changes shown in place, no fake quit/join
 - `echo-message` — your own messages get a server-assigned `msgid` for editing/reacting
 
@@ -53,7 +53,7 @@ Murmur attempts to establish the following IRCv3 capabilities with the server wh
 - `draft/message-redaction` — `/delete` removes your last message (or `/delete <msgid>`); incoming REDACTs render as tombstones
 - `+draft/react` — `/react <emoji>` reacts to the latest message; reactions render as grouped badges
 
-Server support varies — Ergo and Soju cover the most ground; Libera supports identity/presence/history but not editing drafts.
+Server support varies — Ergo and Soju cover the most ground; Libera supports identity/presence/history but not the editing/redaction drafts.
 
 ## Build from source
 
