@@ -397,6 +397,10 @@ enum Message {
     EmojiPickerQuery(String),
     EmojiPickerCategory(emoji::Category),
     EmojiInsert(&'static str),
+    MessageContextOpen { channel_idx: usize, msgid: String, is_mine: bool },
+    MessageContextClose,
+    MessageContextDelete,
+    MessageContextStartReact,
 }
 
 #[derive(Clone)]
@@ -539,12 +543,26 @@ struct App {
     /// Per-target server-side read marker (timestamp last reported by MARKREAD).
     read_markers: HashMap<(NetworkId, String), String>,
     emoji_picker: Option<EmojiPickerState>,
+    message_context: Option<MessageContextState>,
 }
 
 #[derive(Default)]
 struct EmojiPickerState {
     query: String,
     category: Option<emoji::Category>,
+    react_target: Option<ReactTarget>,
+}
+
+#[derive(Clone)]
+struct ReactTarget {
+    channel_idx: usize,
+    msgid: String,
+}
+
+struct MessageContextState {
+    channel_idx: usize,
+    msgid: String,
+    is_mine: bool,
 }
 
 struct TabState {
@@ -662,6 +680,7 @@ impl Default for App {
             typing_sent: HashMap::new(),
             read_markers: HashMap::new(),
             emoji_picker: None,
+            message_context: None,
         };
 
         match config::load() {
@@ -901,6 +920,32 @@ fn reactions_row<'a>(
     }
     container(row_el)
         .padding(pad(0.0, 0.0, tok::S1 as f32, 64.0))
+        .into()
+}
+
+fn message_action_bar<'a>(ctx: &'a MessageContextState) -> Element<'a, Message> {
+    let make_btn = |label: &'static str, msg: Message| -> Element<'a, Message> {
+        button(
+            text(label)
+                .size(sz(11.0))
+                .color(tok::text_mid())
+                .font(regular()),
+        )
+        .padding(pad(2.0, 8.0, 2.0, 8.0))
+        .on_press(msg)
+        .style(|_, status| ghost_button_style(status))
+        .into()
+    };
+
+    let mut items: Vec<Element<Message>> = Vec::new();
+    items.push(make_btn("☺ React", Message::MessageContextStartReact));
+    if ctx.is_mine {
+        items.push(make_btn("✕ Delete", Message::MessageContextDelete));
+    }
+    items.push(make_btn("Dismiss", Message::MessageContextClose));
+
+    container(row(items).spacing(tok::S2))
+        .padding(pad(2.0, 0.0, tok::S1 as f32, 64.0))
         .into()
 }
 
@@ -1642,9 +1687,71 @@ impl App {
                 Task::none()
             }
             Message::EmojiInsert(ch) => {
-                self.input.push_str(ch);
+                let target = self
+                    .emoji_picker
+                    .as_ref()
+                    .and_then(|p| p.react_target.clone());
                 self.emoji_picker = None;
+                if let Some(rt) = target {
+                    let now = Instant::now();
+                    if let Some(channel) = self.channels.get(rt.channel_idx) {
+                        let target_name = channel.name.clone();
+                        self.send_out(
+                            Outgoing::React {
+                                target: target_name,
+                                msgid: rt.msgid,
+                                emoji: ch.to_string(),
+                            },
+                            now,
+                        );
+                    }
+                } else {
+                    self.input.push_str(ch);
+                }
                 iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::MessageContextOpen { channel_idx, msgid, is_mine } => {
+                self.message_context = Some(MessageContextState {
+                    channel_idx,
+                    msgid,
+                    is_mine,
+                });
+                Task::none()
+            }
+            Message::MessageContextClose => {
+                self.message_context = None;
+                Task::none()
+            }
+            Message::MessageContextDelete => {
+                if let Some(ctx) = self.message_context.take() {
+                    let now = Instant::now();
+                    if let Some(channel) = self.channels.get(ctx.channel_idx) {
+                        let target = channel.name.clone();
+                        self.send_out(
+                            Outgoing::Redact {
+                                target,
+                                msgid: ctx.msgid,
+                                reason: None,
+                            },
+                            now,
+                        );
+                    }
+                }
+                Task::none()
+            }
+            Message::MessageContextStartReact => {
+                if let Some(ctx) = self.message_context.take() {
+                    self.emoji_picker = Some(EmojiPickerState {
+                        react_target: Some(ReactTarget {
+                            channel_idx: ctx.channel_idx,
+                            msgid: ctx.msgid,
+                        }),
+                        ..EmojiPickerState::default()
+                    });
+                    iced::widget::operation::focus(EMOJI_PICKER_INPUT_ID)
+                } else {
+                    Task::none()
+                }
             }
         }
     }
@@ -1774,6 +1881,14 @@ impl App {
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         {
             self.emoji_picker = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
+        // Esc closes the per-message action bar.
+        if self.message_context.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.message_context = None;
             return iced::widget::operation::focus(COMPOSE_INPUT_ID);
         }
 
@@ -4963,7 +5078,30 @@ matched on word boundaries.",
                 1.0
             };
 
-            out.push(self.message_line(m, grouped, dim_level, baseline));
+            let line = self.message_line(m, grouped, dim_level, baseline);
+            let line_el: Element<Message> = if let Some(msgid) = m.msgid.clone() {
+                let is_mine = m.nick.eq_ignore_ascii_case(my_nick);
+                let channel_idx = self.selected;
+                mouse_area(line)
+                    .on_right_press(Message::MessageContextOpen {
+                        channel_idx,
+                        msgid,
+                        is_mine,
+                    })
+                    .into()
+            } else {
+                line
+            };
+            out.push(line_el);
+
+            if let Some(ctx) = self.message_context.as_ref() {
+                if ctx.channel_idx == self.selected
+                    && m.msgid.as_deref() == Some(ctx.msgid.as_str())
+                {
+                    out.push(message_action_bar(ctx));
+                }
+            }
+
             if !m.reactions.is_empty() {
                 out.push(reactions_row(&m.reactions));
             }
