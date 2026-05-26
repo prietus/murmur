@@ -1051,7 +1051,15 @@ fn extract_meta(
                     m.server_time_hhmm = parse_iso_hhmm(val);
                 }
             }
+            // Standard IRCv3 `msgid`. `draft/msgid` is the pre-stabilisation
+            // name some older servers still emit. Only overwrite from the
+            // draft form if we haven't already seen the standard one.
             "msgid" => m.msgid = v.clone(),
+            "draft/msgid" => {
+                if m.msgid.is_none() {
+                    m.msgid = v.clone();
+                }
+            }
             "account" => {
                 // `account=*` means logged-out per IRCv3; treat as None.
                 m.account = v.clone().filter(|s| !s.is_empty() && s != "*");

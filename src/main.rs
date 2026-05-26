@@ -104,6 +104,8 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/delete", "delete your last message — or /delete <msgid> for a specific one", false),
     ("/react", "react with emoji: /react <emoji> (on your last received msg) or /react <msgid> <emoji>", true),
     ("/setname", "change your realname mid-session (IRCv3 setname): /setname <new realname>", true),
+    ("/msgid", "debug: show msgid of last message — or /msgid <substring> to grep recent ones", false),
+    ("/caps", "debug: list IRCv3 capabilities ACKed by the server", false),
 ];
 
 fn main() -> iced::Result {
@@ -425,7 +427,7 @@ enum Message {
     EmojiPickerQuery(String),
     EmojiPickerCategory(emoji::Category),
     EmojiInsert(&'static str),
-    MessageContextOpen { channel_idx: usize, msgid: String, is_mine: bool },
+    MessageContextOpen { channel_idx: usize, msgid: String },
     MessageContextClose,
     MessageContextDelete,
     MessageContextStartReact,
@@ -590,7 +592,6 @@ struct ReactTarget {
 struct MessageContextState {
     channel_idx: usize,
     msgid: String,
-    is_mine: bool,
 }
 
 struct TabState {
@@ -965,11 +966,13 @@ fn message_action_bar<'a>(ctx: &'a MessageContextState) -> Element<'a, Message> 
         .into()
     };
 
+    let _ = ctx;
     let mut items: Vec<Element<Message>> = Vec::new();
     items.push(make_btn("☺ React", Message::MessageContextStartReact));
-    if ctx.is_mine {
-        items.push(make_btn("✕ Delete", Message::MessageContextDelete));
-    }
+    // Always offer Delete: server enforces ownership/op via FAIL REDACT.
+    // Gating on local nick comparison was unreliable across chathistory
+    // replay and bouncer-routed echoes.
+    items.push(make_btn("✕ Delete", Message::MessageContextDelete));
     items.push(make_btn("Dismiss", Message::MessageContextClose));
 
     container(row(items).spacing(tok::S2))
@@ -1739,11 +1742,10 @@ impl App {
                 }
                 iced::widget::operation::focus(COMPOSE_INPUT_ID)
             }
-            Message::MessageContextOpen { channel_idx, msgid, is_mine } => {
+            Message::MessageContextOpen { channel_idx, msgid } => {
                 self.message_context = Some(MessageContextState {
                     channel_idx,
                     msgid,
-                    is_mine,
                 });
                 Task::none()
             }
@@ -2216,6 +2218,8 @@ impl App {
             "delete" | "redact" => self.cmd_delete(rest, now),
             "react" => self.cmd_react(rest, now),
             "setname" => self.cmd_setname(rest, now),
+            "msgid" => self.cmd_msgid(rest, now),
+            "caps" => self.cmd_caps(now),
             other => {
                 self.channels[self.selected]
                     .messages
@@ -2723,6 +2727,58 @@ impl App {
         ) {
             return;
         }
+    }
+
+    fn cmd_msgid(&mut self, rest: &str, now: Instant) {
+        let needle = rest.trim().to_ascii_lowercase();
+        let i = self.selected;
+        let net_id = self.channels[i].network_id;
+        let total = self.channels[i].messages.len();
+        let with_id = self.channels[i].messages.iter().filter(|m| m.msgid.is_some()).count();
+        let hit = self.channels[i]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.msgid.is_some()
+                    && (needle.is_empty() || m.body.to_ascii_lowercase().contains(&needle))
+            })
+            .map(|m| (m.msgid.clone().unwrap(), m.nick.clone(), m.body.clone()));
+        let line = match hit {
+            Some((id, nick, body)) => {
+                let preview: String = body.chars().take(60).collect();
+                let suffix = if body.chars().count() > 60 { "…" } else { "" };
+                format!("msgid: {id} — {nick}: {preview}{suffix}")
+            }
+            None => {
+                let caps = self.net(net_id).map(|n| &n.caps_acked);
+                let has = |c: &str| caps.is_some_and(|s| s.contains(c));
+                let diag = format!(
+                    "no msgid-bearing message ({with_id}/{total} in buffer) — caps: message-tags={} echo-message={} server-time={}",
+                    if has("message-tags") { "✓" } else { "✗" },
+                    if has("echo-message") { "✓" } else { "✗" },
+                    if has("server-time") { "✓" } else { "✗" },
+                );
+                if needle.is_empty() { diag } else { format!("{diag} (filter: {:?})", needle) }
+            }
+        };
+        self.channels[i].messages.push(system_line(&line, now));
+    }
+
+    fn cmd_caps(&mut self, now: Instant) {
+        let i = self.selected;
+        let net_id = self.channels[i].network_id;
+        let mut caps: Vec<String> = self
+            .net(net_id)
+            .map(|n| n.caps_acked.iter().cloned().collect())
+            .unwrap_or_default();
+        caps.sort();
+        let line = if caps.is_empty() {
+            "no IRCv3 caps acked (or not connected)".to_string()
+        } else {
+            format!("caps acked ({}): {}", caps.len(), caps.join(" "))
+        };
+        self.channels[i].messages.push(system_line(&line, now));
     }
 
     fn cmd_history(&mut self, now: Instant) {
@@ -3781,12 +3837,12 @@ impl App {
                 continue;
             }
             if ch.members.iter().any(|n| n == nick) {
-                ch.messages.push(system_line(body, now));
+                ch.messages.push(joinpart_line(body, now));
                 hit_any = true;
             }
         }
         if !hit_any {
-            self.push_status_in(network_id, system_line(body, now));
+            self.push_status_in(network_id, joinpart_line(body, now));
         }
     }
 
@@ -5144,13 +5200,11 @@ matched on word boundaries.",
 
             let line = self.message_line(m, grouped, dim_level, baseline);
             let line_el: Element<Message> = if let Some(msgid) = m.msgid.clone() {
-                let is_mine = m.nick.eq_ignore_ascii_case(my_nick);
                 let channel_idx = self.selected;
                 mouse_area(line)
                     .on_right_press(Message::MessageContextOpen {
                         channel_idx,
                         msgid,
-                        is_mine,
                     })
                     .into()
             } else {
