@@ -174,6 +174,9 @@ pub enum Event {
     CapsAcked(Vec<String>),
     ConnectError(String),
     Disconnected,
+    /// Recoverable disconnect; another attempt is scheduled in `in_secs`.
+    /// The UI uses this to keep the dot orange (Connecting) instead of red.
+    Reconnecting { in_secs: u64 },
     Privmsg { target: String, nick: String, body: String, meta: MsgMeta },
     Action { target: String, nick: String, body: String, meta: MsgMeta },
     UserJoined {
@@ -274,314 +277,344 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
         let auth_mode = cfg.auth_mode();
         let use_sasl = matches!(auth_mode, AuthMode::SaslPlain | AuthMode::SaslExternal);
 
-        let irc_cfg = Config {
-            nickname: Some(cfg.nickname.clone()),
-            username: cfg.username.clone(),
-            realname: cfg.realname.clone(),
-            server: Some(cfg.server.clone()),
-            port: Some(cfg.port),
-            use_tls: Some(cfg.use_tls),
-            channels: cfg.channels.clone(),
-            // When SASL is in use we authenticate during connection;
-            // skip the post-MOTD NickServ IDENTIFY the crate would do.
-            nick_password: if use_sasl { None } else { cfg.nick_password.clone() },
-            client_cert_path: cfg.client_cert_path.clone(),
-            client_cert_pass: cfg.client_cert_pass.clone(),
-            ..Config::default()
-        };
-
-        let mut client = match Client::from_config(irc_cfg).await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = out.send(Event::ConnectError(e.to_string())).await;
-                return;
-            }
-        };
-
-        let sender = client.sender();
-        let mut stream = match client.stream() {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = out.send(Event::ConnectError(e.to_string())).await;
-                return;
-            }
-        };
-
-        // Pause registration with CAP LS 302 (some bouncers — soju — NAK
-        // any REQ that arrives before LS). Once we see the final LS line
-        // we'll build the REQ from the intersection of `wanted` and what
-        // the server actually advertised.
-        if let Err(e) = sender.send(Command::CAP(
-            None,
-            CapSubCommand::LS,
-            None,
-            Some("302".to_string()),
-        )) {
-            let _ = out.send(Event::ConnectError(e.to_string())).await;
-            return;
-        }
-        let mut auth_phase = AuthPhase::AwaitingCapLs;
-        let mut cap_state = CapState::default();
-        let mut batches: HashMap<String, BatchInfo> = HashMap::new();
-        let mut isupport = ISupport::default();
-
-        if use_sasl {
-            let mech = match auth_mode {
-                AuthMode::SaslExternal => "EXTERNAL",
-                _ => "PLAIN",
-            };
-            let _ = out
-                .send(Event::Notice {
-                    from: "*".into(),
-                    text: format!("authenticating with SASL {mech}…"),
-                    meta: MsgMeta::default(),
-                })
-                .await;
-        }
-
+        // Reconnect loop. Each iteration is one connection attempt. On a
+        // recoverable failure (TCP drop, PingTimeout, server-closed stream)
+        // we back off and try again; the same `otx`/`orx` pair is reused
+        // across attempts so the App's stored Outgoing sender stays valid.
+        let mut attempt: u32 = 0;
         loop {
-            tokio::select! {
-                incoming = stream.next() => match incoming {
-                    Some(Ok(msg)) => {
-                        if auth_phase == AuthPhase::Done {
-                            // `cap-notify` push: handle CAP NEW/ACK/DEL that
-                            // arrive mid-session (typically from bouncers).
-                            if let Some(updated) =
-                                handle_cap_notify(&msg, &sender, &mut cap_state)
-                            {
-                                let _ = out.send(Event::CapsAcked(updated)).await;
-                            }
-                            // Drop CAP wire chatter from the chat view.
-                            if matches!(&msg.command, Command::CAP(..)) {
-                                continue;
-                            }
-                        }
-                        if auth_phase != AuthPhase::Done {
-                            match handle_auth_msg(
-                                &msg, &sender, &mut auth_phase, auth_mode,
-                                &cfg, &mut cap_state,
-                            ) {
-                                AuthOutcome::Pending => {}
-                                AuthOutcome::NeedIdentify => {
-                                    if let Err(e) = client.identify() {
-                                        let _ = out
-                                            .send(Event::ConnectError(e.to_string()))
-                                            .await;
+            if use_sasl {
+                let mech = match auth_mode {
+                    AuthMode::SaslExternal => "EXTERNAL",
+                    _ => "PLAIN",
+                };
+                let _ = out
+                    .send(Event::Notice {
+                        from: "*".into(),
+                        text: format!("authenticating with SASL {mech}…"),
+                        meta: MsgMeta::default(),
+                    })
+                    .await;
+            }
+
+            let irc_cfg = Config {
+                nickname: Some(cfg.nickname.clone()),
+                username: cfg.username.clone(),
+                realname: cfg.realname.clone(),
+                server: Some(cfg.server.clone()),
+                port: Some(cfg.port),
+                use_tls: Some(cfg.use_tls),
+                channels: cfg.channels.clone(),
+                // When SASL is in use we authenticate during connection;
+                // skip the post-MOTD NickServ IDENTIFY the crate would do.
+                nick_password: if use_sasl { None } else { cfg.nick_password.clone() },
+                client_cert_path: cfg.client_cert_path.clone(),
+                client_cert_pass: cfg.client_cert_pass.clone(),
+                ..Config::default()
+            };
+
+            let outcome: AttemptOutcome = 'attempt: {
+                let mut client = match Client::from_config(irc_cfg).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        break 'attempt AttemptOutcome::Recoverable(e.to_string());
+                    }
+                };
+
+                let sender = client.sender();
+                let mut stream = match client.stream() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        break 'attempt AttemptOutcome::Fatal(e.to_string());
+                    }
+                };
+
+                // Pause registration with CAP LS 302 (some bouncers — soju —
+                // NAK any REQ that arrives before LS). Once we see the final
+                // LS line we'll build the REQ from the intersection of
+                // `wanted` and what the server actually advertised.
+                if let Err(e) = sender.send(Command::CAP(
+                    None,
+                    CapSubCommand::LS,
+                    None,
+                    Some("302".to_string()),
+                )) {
+                    break 'attempt AttemptOutcome::Recoverable(e.to_string());
+                }
+                let mut auth_phase = AuthPhase::AwaitingCapLs;
+                let mut cap_state = CapState::default();
+                let mut batches: HashMap<String, BatchInfo> = HashMap::new();
+                let mut isupport = ISupport::default();
+
+                loop {
+                    tokio::select! {
+                        incoming = stream.next() => match incoming {
+                            Some(Ok(msg)) => {
+                                if auth_phase == AuthPhase::Done {
+                                    // `cap-notify` push: handle CAP NEW/ACK/DEL
+                                    // mid-session (typically from bouncers).
+                                    if let Some(updated) =
+                                        handle_cap_notify(&msg, &sender, &mut cap_state)
+                                    {
+                                        let _ = out.send(Event::CapsAcked(updated)).await;
+                                    }
+                                    // Drop CAP wire chatter from the chat view.
+                                    if matches!(&msg.command, Command::CAP(..)) {
+                                        continue;
+                                    }
+                                }
+                                if auth_phase != AuthPhase::Done {
+                                    match handle_auth_msg(
+                                        &msg, &sender, &mut auth_phase, auth_mode,
+                                        &cfg, &mut cap_state,
+                                    ) {
+                                        AuthOutcome::Pending => {}
+                                        AuthOutcome::NeedIdentify => {
+                                            if let Err(e) = client.identify() {
+                                                break 'attempt
+                                                    AttemptOutcome::Fatal(e.to_string());
+                                            }
+                                            auth_phase = AuthPhase::Done;
+                                            let acked: Vec<String> =
+                                                cap_state.acked.iter().cloned().collect();
+                                            let _ = out.send(Event::CapsAcked(acked)).await;
+                                            let _ = out.send(Event::Connected).await;
+                                            attempt = 0;
+                                        }
+                                        AuthOutcome::Done => {
+                                            let acked: Vec<String> =
+                                                cap_state.acked.iter().cloned().collect();
+                                            let _ = out.send(Event::CapsAcked(acked)).await;
+                                            // Brief positive confirmation in
+                                            // &status — helpful for cert/auth
+                                            // troubleshooting.
+                                            let mech = match auth_mode {
+                                                AuthMode::SaslExternal => "EXTERNAL",
+                                                AuthMode::SaslPlain => "PLAIN",
+                                                _ => "",
+                                            };
+                                            if !mech.is_empty() {
+                                                let _ = out
+                                                    .send(Event::Notice {
+                                                        from: "*".into(),
+                                                        text: format!(
+                                                            "SASL {mech} authentication successful"
+                                                        ),
+                                                        meta: MsgMeta::default(),
+                                                    })
+                                                    .await;
+                                            }
+                                            let _ = out.send(Event::Connected).await;
+                                            attempt = 0;
+                                        }
+                                        AuthOutcome::Failed(reason) => {
+                                            break 'attempt AttemptOutcome::Fatal(reason);
+                                        }
+                                    }
+                                    // Don't surface CAP/AUTHENTICATE/9xx-auth wire chatter to UI.
+                                    if is_auth_wire(&msg) {
+                                        continue;
+                                    }
+                                }
+                                // Intercept BATCH for netsplit/netjoin grouping;
+                                // produce a single summary Notice on close
+                                // instead of letting dozens of QUIT/JOIN
+                                // lines through individually.
+                                if let Command::BATCH(ref tag_with_sign, ref sub, ref params) =
+                                    msg.command
+                                {
+                                    if let Some(id) = tag_with_sign.strip_prefix('+') {
+                                        let kind = sub
+                                            .as_ref()
+                                            .map(|s| s.to_str().to_ascii_lowercase())
+                                            .unwrap_or_default();
+                                        batches.insert(
+                                            id.to_string(),
+                                            BatchInfo {
+                                                kind,
+                                                params: params.clone().unwrap_or_default(),
+                                                chunks: Vec::new(),
+                                            },
+                                        );
+                                    } else if let Some(id) = tag_with_sign.strip_prefix('-') {
+                                        if let Some(info) = batches.remove(id) {
+                                            if let Some(ev) = finalize_multiline(&info) {
+                                                if out.send(ev).await.is_err() {
+                                                    return;
+                                                }
+                                            } else if let Some(text) = batch_summary(&info) {
+                                                let _ = out
+                                                    .send(Event::Notice {
+                                                        from: "*".into(),
+                                                        text,
+                                                        meta: MsgMeta::default(),
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // If this message belongs to an open
+                                // draft/multiline batch, accumulate it and
+                                // don't emit a per-chunk event — the batch
+                                // close will produce one combined.
+                                if accumulate_multiline_chunk(&msg, &mut batches) {
+                                    continue;
+                                }
+                                for ev in translate(msg, &batches, &mut isupport) {
+                                    if out.send(ev).await.is_err() {
                                         return;
                                     }
-                                    auth_phase = AuthPhase::Done;
-                                    let acked: Vec<String> =
-                                        cap_state.acked.iter().cloned().collect();
-                                    let _ = out.send(Event::CapsAcked(acked)).await;
-                                    let _ = out.send(Event::Connected).await;
-                                }
-                                AuthOutcome::Done => {
-                                    let acked: Vec<String> =
-                                        cap_state.acked.iter().cloned().collect();
-                                    let _ = out.send(Event::CapsAcked(acked)).await;
-                                    // Brief positive confirmation in &status —
-                                    // helpful when troubleshooting cert/auth.
-                                    let mech = match auth_mode {
-                                        AuthMode::SaslExternal => "EXTERNAL",
-                                        AuthMode::SaslPlain => "PLAIN",
-                                        _ => "",
-                                    };
-                                    if !mech.is_empty() {
-                                        let _ = out
-                                            .send(Event::Notice {
-                                                from: "*".into(),
-                                                text: format!(
-                                                    "SASL {mech} authentication successful"
-                                                ),
-                                                meta: MsgMeta::default(),
-                                            })
-                                            .await;
-                                    }
-                                    let _ = out.send(Event::Connected).await;
-                                }
-                                AuthOutcome::Failed(reason) => {
-                                    let _ = out.send(Event::ConnectError(reason)).await;
-                                    return;
                                 }
                             }
-                            // Don't surface CAP/AUTHENTICATE/9xx-auth wire chatter to UI.
-                            if is_auth_wire(&msg) {
-                                continue;
+                            Some(Err(e)) => {
+                                break 'attempt AttemptOutcome::Recoverable(e.to_string());
                             }
-                        }
-                        // Intercept BATCH for netsplit/netjoin grouping; produce
-                        // a single summary Notice on close instead of letting
-                        // dozens of QUIT/JOIN lines through individually.
-                        if let Command::BATCH(ref tag_with_sign, ref sub, ref params) =
-                            msg.command
-                        {
-                            if let Some(id) = tag_with_sign.strip_prefix('+') {
-                                let kind = sub
-                                    .as_ref()
-                                    .map(|s| s.to_str().to_ascii_lowercase())
-                                    .unwrap_or_default();
-                                batches.insert(
-                                    id.to_string(),
-                                    BatchInfo {
-                                        kind,
-                                        params: params.clone().unwrap_or_default(),
-                                        chunks: Vec::new(),
-                                    },
+                            None => {
+                                break 'attempt AttemptOutcome::Recoverable(
+                                    "server closed connection".into(),
                                 );
-                            } else if let Some(id) = tag_with_sign.strip_prefix('-') {
-                                if let Some(info) = batches.remove(id) {
-                                    if let Some(ev) = finalize_multiline(&info) {
-                                        if out.send(ev).await.is_err() {
-                                            return;
-                                        }
-                                    } else if let Some(text) = batch_summary(&info) {
-                                        let _ = out
-                                            .send(Event::Notice {
-                                                from: "*".into(),
-                                                text,
-                                                meta: MsgMeta::default(),
-                                            })
-                                            .await;
-                                    }
+                            }
+                        },
+                        outgoing = orx.next() => {
+                            match outgoing {
+                                Some(Outgoing::Privmsg { target, text }) => {
+                                    let _ = sender.send_privmsg(&target, &text);
                                 }
-                            }
-                            continue;
-                        }
-                        // If this message belongs to an open draft/multiline
-                        // batch, accumulate it and don't emit a per-chunk
-                        // event — the batch close will produce one combined.
-                        if accumulate_multiline_chunk(&msg, &mut batches) {
-                            continue;
-                        }
-                        for ev in translate(msg, &batches, &mut isupport) {
-                            if out.send(ev).await.is_err() {
-                                return;
+                                Some(Outgoing::Action { target, text }) => {
+                                    let wrapped = format!("\x01ACTION {text}\x01");
+                                    let _ = sender.send_privmsg(&target, &wrapped);
+                                }
+                                Some(Outgoing::Ctcp { target, query }) => {
+                                    let wrapped = format!("\x01{query}\x01");
+                                    let _ = sender.send_privmsg(&target, &wrapped);
+                                }
+                                Some(Outgoing::Join(channel)) => {
+                                    let _ = sender.send_join(&channel);
+                                }
+                                Some(Outgoing::Part { channel, reason }) => {
+                                    let _ = sender.send(Command::PART(channel, reason));
+                                }
+                                Some(Outgoing::Nick(new_nick)) => {
+                                    let _ = sender.send(Command::NICK(new_nick));
+                                }
+                                Some(Outgoing::ChatHistoryLatest { target, limit }) => {
+                                    let _ = sender.send(Command::Raw(
+                                        "CHATHISTORY".into(),
+                                        vec![
+                                            "LATEST".into(),
+                                            target,
+                                            "*".into(),
+                                            limit.to_string(),
+                                        ],
+                                    ));
+                                }
+                                Some(Outgoing::ChatHistoryTargets { from_ts, to_ts, limit }) => {
+                                    let _ = sender.send(Command::Raw(
+                                        "CHATHISTORY".into(),
+                                        vec![
+                                            "TARGETS".into(),
+                                            format!("timestamp={from_ts}"),
+                                            format!("timestamp={to_ts}"),
+                                            limit.to_string(),
+                                        ],
+                                    ));
+                                }
+                                Some(Outgoing::Whois(target)) => {
+                                    let _ = sender.send(Command::WHOIS(None, target));
+                                }
+                                Some(Outgoing::Away(msg)) => {
+                                    let _ = sender.send(Command::AWAY(msg));
+                                }
+                                Some(Outgoing::Topic { channel, topic }) => {
+                                    let _ = sender.send(Command::TOPIC(channel, topic));
+                                }
+                                Some(Outgoing::Raw { cmd, args }) => {
+                                    let _ = sender.send(Command::Raw(cmd, args));
+                                }
+                                Some(Outgoing::Kick { channel, nick, reason }) => {
+                                    let _ = sender.send(Command::KICK(channel, nick, reason));
+                                }
+                                Some(Outgoing::Invite { nick, channel }) => {
+                                    let _ = sender.send(Command::INVITE(nick, channel));
+                                }
+                                Some(Outgoing::Mode { target, modes, args }) => {
+                                    let mut argv = Vec::with_capacity(2 + args.len());
+                                    argv.push(target);
+                                    argv.push(modes);
+                                    argv.extend(args);
+                                    let _ = sender.send(Command::Raw("MODE".into(), argv));
+                                }
+                                Some(Outgoing::Typing { target, state }) => {
+                                    let _ = sender.send(Message {
+                                        tags: Some(vec![Tag(
+                                            "+typing".into(),
+                                            Some(state.as_str().into()),
+                                        )]),
+                                        prefix: None,
+                                        command: Command::Raw("TAGMSG".into(), vec![target]),
+                                    });
+                                }
+                                Some(Outgoing::MarkRead { target, timestamp }) => {
+                                    let mut argv = vec![target];
+                                    if let Some(ts) = timestamp {
+                                        argv.push(format!("timestamp={ts}"));
+                                    }
+                                    let _ = sender.send(Command::Raw("MARKREAD".into(), argv));
+                                }
+                                Some(Outgoing::Redact { target, msgid, reason }) => {
+                                    let mut argv = vec![target, msgid];
+                                    if let Some(r) = reason {
+                                        argv.push(r);
+                                    }
+                                    let _ = sender.send(Command::Raw("REDACT".into(), argv));
+                                }
+                                Some(Outgoing::SetName(realname)) => {
+                                    let _ = sender.send(Command::Raw(
+                                        "SETNAME".into(),
+                                        vec![realname],
+                                    ));
+                                }
+                                Some(Outgoing::React { target, msgid, emoji }) => {
+                                    // Reactions piggyback on TAGMSG with
+                                    // +draft/reply pointing at the target
+                                    // msgid; body lives in +draft/react.
+                                    let _ = sender.send(Message {
+                                        tags: Some(vec![
+                                            Tag("+draft/reply".into(), Some(msgid)),
+                                            Tag("+draft/react".into(), Some(emoji)),
+                                        ]),
+                                        prefix: None,
+                                        command: Command::Raw("TAGMSG".into(), vec![target]),
+                                    });
+                                }
+                                None => {}
                             }
                         }
                     }
-                    Some(Err(e)) => {
-                        let _ = out.send(Event::ConnectError(e.to_string())).await;
-                        return;
-                    }
-                    None => {
-                        let _ = out.send(Event::Disconnected).await;
-                        return;
-                    }
-                },
-                outgoing = orx.next() => {
-                    match outgoing {
-                        Some(Outgoing::Privmsg { target, text }) => {
-                            let _ = sender.send_privmsg(&target, &text);
-                        }
-                        Some(Outgoing::Action { target, text }) => {
-                            let wrapped = format!("\x01ACTION {text}\x01");
-                            let _ = sender.send_privmsg(&target, &wrapped);
-                        }
-                        Some(Outgoing::Ctcp { target, query }) => {
-                            let wrapped = format!("\x01{query}\x01");
-                            let _ = sender.send_privmsg(&target, &wrapped);
-                        }
-                        Some(Outgoing::Join(channel)) => {
-                            let _ = sender.send_join(&channel);
-                        }
-                        Some(Outgoing::Part { channel, reason }) => {
-                            let _ = sender.send(Command::PART(channel, reason));
-                        }
-                        Some(Outgoing::Nick(new_nick)) => {
-                            let _ = sender.send(Command::NICK(new_nick));
-                        }
-                        Some(Outgoing::ChatHistoryLatest { target, limit }) => {
-                            let _ = sender.send(Command::Raw(
-                                "CHATHISTORY".into(),
-                                vec![
-                                    "LATEST".into(),
-                                    target,
-                                    "*".into(),
-                                    limit.to_string(),
-                                ],
-                            ));
-                        }
-                        Some(Outgoing::ChatHistoryTargets { from_ts, to_ts, limit }) => {
-                            let _ = sender.send(Command::Raw(
-                                "CHATHISTORY".into(),
-                                vec![
-                                    "TARGETS".into(),
-                                    format!("timestamp={from_ts}"),
-                                    format!("timestamp={to_ts}"),
-                                    limit.to_string(),
-                                ],
-                            ));
-                        }
-                        Some(Outgoing::Whois(target)) => {
-                            let _ = sender.send(Command::WHOIS(None, target));
-                        }
-                        Some(Outgoing::Away(msg)) => {
-                            let _ = sender.send(Command::AWAY(msg));
-                        }
-                        Some(Outgoing::Topic { channel, topic }) => {
-                            let _ = sender.send(Command::TOPIC(channel, topic));
-                        }
-                        Some(Outgoing::Raw { cmd, args }) => {
-                            let _ = sender.send(Command::Raw(cmd, args));
-                        }
-                        Some(Outgoing::Kick { channel, nick, reason }) => {
-                            let _ = sender.send(Command::KICK(channel, nick, reason));
-                        }
-                        Some(Outgoing::Invite { nick, channel }) => {
-                            let _ = sender.send(Command::INVITE(nick, channel));
-                        }
-                        Some(Outgoing::Mode { target, modes, args }) => {
-                            let mut argv = Vec::with_capacity(2 + args.len());
-                            argv.push(target);
-                            argv.push(modes);
-                            argv.extend(args);
-                            let _ = sender.send(Command::Raw("MODE".into(), argv));
-                        }
-                        Some(Outgoing::Typing { target, state }) => {
-                            let _ = sender.send(Message {
-                                tags: Some(vec![Tag(
-                                    "+typing".into(),
-                                    Some(state.as_str().into()),
-                                )]),
-                                prefix: None,
-                                command: Command::Raw("TAGMSG".into(), vec![target]),
-                            });
-                        }
-                        Some(Outgoing::MarkRead { target, timestamp }) => {
-                            let mut argv = vec![target];
-                            if let Some(ts) = timestamp {
-                                argv.push(format!("timestamp={ts}"));
-                            }
-                            let _ = sender.send(Command::Raw("MARKREAD".into(), argv));
-                        }
-                        Some(Outgoing::Redact { target, msgid, reason }) => {
-                            let mut argv = vec![target, msgid];
-                            if let Some(r) = reason {
-                                argv.push(r);
-                            }
-                            let _ = sender.send(Command::Raw("REDACT".into(), argv));
-                        }
-                        Some(Outgoing::SetName(realname)) => {
-                            let _ = sender.send(Command::Raw(
-                                "SETNAME".into(),
-                                vec![realname],
-                            ));
-                        }
-                        Some(Outgoing::React { target, msgid, emoji }) => {
-                            // Reactions piggyback on TAGMSG with +draft/reply
-                            // pointing at the target msgid; body lives in the
-                            // +draft/react tag.
-                            let _ = sender.send(Message {
-                                tags: Some(vec![
-                                    Tag("+draft/reply".into(), Some(msgid)),
-                                    Tag("+draft/react".into(), Some(emoji)),
-                                ]),
-                                prefix: None,
-                                command: Command::Raw("TAGMSG".into(), vec![target]),
-                            });
-                        }
-                        None => {}
-                    }
+                }
+            };
+
+            match outcome {
+                AttemptOutcome::Fatal(e) => {
+                    let _ = out.send(Event::ConnectError(e)).await;
+                    return;
+                }
+                AttemptOutcome::Recoverable(e) => {
+                    let secs = backoff_secs(attempt);
+                    attempt = attempt.saturating_add(1);
+                    let _ = out
+                        .send(Event::Notice {
+                            from: "*".into(),
+                            text: format!(
+                                "disconnected: {e} — reconnecting in {secs}s"
+                            ),
+                            meta: MsgMeta::default(),
+                        })
+                        .await;
+                    let _ = out.send(Event::Reconnecting { in_secs: secs }).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 }
             }
         }
@@ -593,6 +626,28 @@ enum AuthOutcome {
     NeedIdentify,
     Done,
     Failed(String),
+}
+
+/// Result of one connection attempt in the reconnect loop.
+enum AttemptOutcome {
+    /// Network-level failure — retry with backoff (TCP drop, PingTimeout,
+    /// server-closed stream, transient connect error).
+    Recoverable(String),
+    /// Won't get better by retrying (SASL credentials rejected, malformed
+    /// config the client crate refused, etc.). Stop and stay red.
+    Fatal(String),
+}
+
+/// Backoff schedule: 2, 4, 8, 16, 30, then 60 cap.
+fn backoff_secs(attempt: u32) -> u64 {
+    match attempt {
+        0 => 2,
+        1 => 4,
+        2 => 8,
+        3 => 16,
+        4 => 30,
+        _ => 60,
+    }
 }
 
 // Once auth is complete, the server may push CAP NEW / CAP DEL via the
@@ -1096,11 +1151,18 @@ fn batch_summary(info: &BatchInfo) -> Option<String> {
     }
 }
 
-/// Pulls "HH:MM" out of an ISO-8601 timestamp like `2026-05-04T20:30:25.123Z`.
+/// Pulls "HH:MM" out of an ISO-8601 UTC timestamp like
+/// `2026-05-04T20:30:25.123Z` and shifts it into the local zone using the
+/// offset captured at process start. `server-time` is mandated UTC by IRCv3.
 fn parse_iso_hhmm(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     if bytes.len() >= 16 && bytes[10] == b'T' {
-        Some(s[11..16].to_string())
+        let h: i64 = s[11..13].parse().ok()?;
+        let m: i64 = s[14..16].parse().ok()?;
+        let total = (h * 60 + m + crate::local_offset_secs() / 60).rem_euclid(1440);
+        let h = total / 60;
+        let m = total % 60;
+        Some(format!("{h:02}:{m:02}"))
     } else {
         None
     }

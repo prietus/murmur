@@ -6,6 +6,7 @@ mod irc_worker;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -34,6 +35,15 @@ const FONT_NAME: &str = "JetBrains Mono";
 
 static USER_FONT: OnceLock<&'static str> = OnceLock::new();
 static FONT_SCALE: OnceLock<f32> = OnceLock::new();
+// Local UTC offset in seconds, captured once at process start before any
+// threads spawn. IRCv3 `server-time` is always UTC; we add this to render
+// timestamps in the user's local zone. DST changes during a long-running
+// session won't update until relaunch.
+static LOCAL_OFFSET_SECS: AtomicI32 = AtomicI32::new(0);
+
+pub fn local_offset_secs() -> i64 {
+    LOCAL_OFFSET_SECS.load(Ordering::Relaxed) as i64
+}
 
 const FADE_MS: u128 = 250;
 const GROUP_SECS: u64 = 300;
@@ -97,6 +107,12 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
 ];
 
 fn main() -> iced::Result {
+    // Must run before any other thread spawns: the `time` crate refuses to
+    // read the local TZ from a multithreaded process (POSIX unsoundness).
+    if let Ok(off) = time::UtcOffset::current_local_offset() {
+        LOCAL_OFFSET_SECS.store(off.whole_seconds(), Ordering::Relaxed);
+    }
+
     // macOS: pin the application identity used by notify-rust so its
     // underlying mac-notification-sys does not fall back to an in-process
     // AppleScript bundle-id lookup, which on unsigned Mach-O binaries can
@@ -1113,9 +1129,10 @@ fn now_hhmm() -> String {
     let s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let h = (s / 3600) % 24;
-    let m = (s / 60) % 60;
+        .unwrap_or(0) as i64
+        + local_offset_secs();
+    let h = s.rem_euclid(86400) / 3600;
+    let m = s.rem_euclid(3600) / 60;
     format!("{h:02}:{m:02}")
 }
 
@@ -3182,6 +3199,17 @@ impl App {
                     net.status = ConnStatus::Disconnected;
                 }
                 self.push_status_in(network_id, system_line("disconnected", now));
+                Task::none()
+            }
+            IrcEvent::Reconnecting { in_secs: _ } => {
+                // Worker is going to retry — keep the dot orange (Connecting)
+                // rather than red, and clear the last error so we don't
+                // misrepresent state. The Notice carrying the "reconnecting
+                // in Ns…" line is emitted separately by the worker.
+                if let Some(net) = self.net_mut(network_id) {
+                    net.status = ConnStatus::Connecting;
+                    net.last_error = None;
+                }
                 Task::none()
             }
             IrcEvent::Privmsg { target, nick, body, meta } => {
