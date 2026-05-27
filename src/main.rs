@@ -431,6 +431,15 @@ enum Message {
     MessageContextClose,
     MessageContextDelete,
     MessageContextStartReact,
+    MemberContextOpen { nick: String },
+    MemberContextClose,
+    MemberContextDm,
+    MemberContextWhois,
+    MemberContextIgnoreToggle,
+    MemberContextOpToggle,
+    MemberContextVoiceToggle,
+    MemberContextKick,
+    MemberContextBan,
 }
 
 #[derive(Clone)]
@@ -574,6 +583,7 @@ struct App {
     read_markers: HashMap<(NetworkId, String), String>,
     emoji_picker: Option<EmojiPickerState>,
     message_context: Option<MessageContextState>,
+    member_context: Option<MemberContextState>,
 }
 
 #[derive(Default)]
@@ -592,6 +602,11 @@ struct ReactTarget {
 struct MessageContextState {
     channel_idx: usize,
     msgid: String,
+}
+
+struct MemberContextState {
+    channel_idx: usize,
+    nick: String,
 }
 
 struct TabState {
@@ -710,6 +725,7 @@ impl Default for App {
             read_markers: HashMap::new(),
             emoji_picker: None,
             message_context: None,
+            member_context: None,
         };
 
         match config::load() {
@@ -950,6 +966,20 @@ fn reactions_row<'a>(
     container(row_el)
         .padding(pad(0.0, 0.0, tok::S1 as f32, 64.0))
         .into()
+}
+
+fn member_action_button<'a>(label: String, msg: Message) -> Element<'a, Message> {
+    button(
+        text(label)
+            .size(sz(11.0))
+            .color(tok::text_mid())
+            .font(regular()),
+    )
+    .width(Fill)
+    .padding(pad(3.0, 8.0, 3.0, 8.0))
+    .on_press(msg)
+    .style(|_, status| ghost_button_style(status))
+    .into()
 }
 
 fn message_action_bar<'a>(ctx: &'a MessageContextState) -> Element<'a, Message> {
@@ -1784,6 +1814,79 @@ impl App {
                     Task::none()
                 }
             }
+            Message::MemberContextOpen { nick } => {
+                self.member_context = Some(MemberContextState {
+                    channel_idx: self.selected,
+                    nick,
+                });
+                Task::none()
+            }
+            Message::MemberContextClose => {
+                self.member_context = None;
+                Task::none()
+            }
+            Message::MemberContextDm => {
+                if let Some(ctx) = self.member_context.take() {
+                    let idx = self.ensure_channel(&ctx.nick);
+                    self.set_selected(idx);
+                }
+                Task::none()
+            }
+            Message::MemberContextWhois => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    self.cmd_whois(&ctx.nick, now);
+                }
+                Task::none()
+            }
+            Message::MemberContextIgnoreToggle => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    if self.is_ignored(&ctx.nick) {
+                        self.cmd_unignore(&ctx.nick, now);
+                    } else {
+                        self.cmd_ignore(&ctx.nick, now);
+                    }
+                }
+                Task::none()
+            }
+            Message::MemberContextOpToggle => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    let sign = if matches!(
+                        self.member_prefix(&ctx.nick),
+                        Some('~') | Some('&') | Some('@')
+                    ) { "-" } else { "+" };
+                    self.cmd_channel_priv(sign, "o", &ctx.nick, now);
+                }
+                Task::none()
+            }
+            Message::MemberContextVoiceToggle => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    let sign = if matches!(self.member_prefix(&ctx.nick), Some('+')) {
+                        "-"
+                    } else {
+                        "+"
+                    };
+                    self.cmd_channel_priv(sign, "v", &ctx.nick, now);
+                }
+                Task::none()
+            }
+            Message::MemberContextKick => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    self.cmd_kick(&ctx.nick, now);
+                }
+                Task::none()
+            }
+            Message::MemberContextBan => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    self.cmd_ban(true, &ctx.nick, now);
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1920,6 +2023,14 @@ impl App {
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         {
             self.message_context = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
+        // Esc closes the per-member action bar.
+        if self.member_context.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.member_context = None;
             return iced::widget::operation::focus(COMPOSE_INPUT_ID);
         }
 
@@ -5403,12 +5514,16 @@ matched on word boundaries.",
     fn member_pane(&self, width: f32, target: f32) -> Element<'_, Message> {
         let ch = &self.channels[self.selected];
 
-        let items: Vec<Element<Message>> = ch
-            .members
-            .iter()
-            .enumerate()
-            .map(|(i, m)| self.member_row(i, m))
-            .collect();
+        let ctx_nick = self.member_context.as_ref().and_then(|c| {
+            if c.channel_idx == self.selected { Some(c.nick.as_str()) } else { None }
+        });
+        let mut items: Vec<Element<Message>> = Vec::with_capacity(ch.members.len() + 1);
+        for (i, m) in ch.members.iter().enumerate() {
+            items.push(self.member_row(i, m));
+            if ctx_nick.is_some_and(|n| n == m.as_str()) {
+                items.push(self.member_action_bar(m));
+            }
+        }
 
         let list = scrollable(
             column(items)
@@ -5486,7 +5601,57 @@ matched on word boundaries.",
         mouse_area(btn)
             .on_enter(Message::HoverMember(Some(i)))
             .on_exit(Message::HoverMember(None))
+            .on_right_press(Message::MemberContextOpen { nick: nick.to_string() })
             .interaction(iced::mouse::Interaction::Pointer)
+            .into()
+    }
+
+    fn member_action_bar(&self, nick: &str) -> Element<'_, Message> {
+        let prefix = self.member_prefix(nick);
+        let is_op = matches!(prefix, Some('~') | Some('&') | Some('@'));
+        let is_voiced = matches!(prefix, Some('+'));
+        let ignored = self.is_ignored(nick);
+
+        let mut items: Vec<Element<Message>> = Vec::new();
+        let header = container(
+            text(format!("@{}", nick))
+                .size(sz(10.5))
+                .color(tok::text_faint())
+                .font(regular()),
+        )
+        .padding(pad(2.0, 8.0, 2.0, 8.0));
+        items.push(header.into());
+
+        items.push(member_action_button("Message".into(), Message::MemberContextDm));
+        items.push(member_action_button("Whois".into(), Message::MemberContextWhois));
+        items.push(member_action_button(
+            if ignored { "Unignore".into() } else { "Ignore".into() },
+            Message::MemberContextIgnoreToggle,
+        ));
+        items.push(member_action_button(
+            if is_op { "Deop".into() } else { "Op".into() },
+            Message::MemberContextOpToggle,
+        ));
+        items.push(member_action_button(
+            if is_voiced { "Devoice".into() } else { "Voice".into() },
+            Message::MemberContextVoiceToggle,
+        ));
+        items.push(member_action_button("Kick".into(), Message::MemberContextKick));
+        items.push(member_action_button("Ban".into(), Message::MemberContextBan));
+        items.push(member_action_button("Dismiss".into(), Message::MemberContextClose));
+
+        container(column(items).spacing(1))
+            .padding(pad(2.0, tok::S2 as f32, tok::S2 as f32, tok::S2 as f32))
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_1())),
+                border: Border {
+                    radius: 6.0.into(),
+                    width: 1.0,
+                    color: tok::border_soft(),
+                },
+                ..Default::default()
+            })
             .into()
     }
 

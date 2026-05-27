@@ -1337,6 +1337,7 @@ fn translate(
                 }]
             }
             _ => format_numeric(code, &args)
+                .or_else(|| render_raw_numeric(code as u16, &args))
                 .map(|text| vec![Event::Notice { from: "*".into(), text, meta }])
                 .unwrap_or_default(),
         },
@@ -1346,6 +1347,9 @@ fn translate(
         Command::Raw(ref cmd, ref args) => {
             if let Ok(n) = cmd.parse::<u16>() {
                 if let Some(text) = format_extended_numeric(n, args) {
+                    return vec![Event::Notice { from: "*".into(), text, meta }];
+                }
+                if let Some(text) = render_raw_numeric(n, args) {
                     return vec![Event::Notice { from: "*".into(), text, meta }];
                 }
             }
@@ -1654,6 +1658,29 @@ fn format_extended_numeric(code: u16, args: &[String]) -> Option<String> {
         379 if args.len() >= 3 => Some(format!("whois {}: {}", p(1), p(2))),
         _ => None,
     }
+}
+
+// Suppress connect-time noise: welcome banner, LUSERS stats, MOTD.
+// Everything else not otherwise handled falls through to a raw render
+// so that /raw <CMD> actually surfaces the server reply.
+fn is_suppressed_numeric(code: u16) -> bool {
+    matches!(code,
+        1 | 2 | 3 | 4 | 5
+        | 251 | 252 | 253 | 254 | 255 | 265 | 266
+        | 372 | 375 | 376 | 422
+    )
+}
+
+fn render_raw_numeric(code: u16, args: &[String]) -> Option<String> {
+    if is_suppressed_numeric(code) {
+        return None;
+    }
+    let body = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        args.join(" ")
+    };
+    Some(format!("[{code}] {body}"))
 }
 
 fn is_ctcp_wrapped(body: &str) -> bool {
