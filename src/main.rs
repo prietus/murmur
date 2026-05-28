@@ -440,6 +440,12 @@ enum Message {
     MemberContextVoiceToggle,
     MemberContextKick,
     MemberContextBan,
+    AttachFilePressed,
+    FilePicked(Option<std::path::PathBuf>),
+    UploadFinished(Result<String, String>),
+    SettingsUploadUseCustom(bool),
+    SettingsUploadField(UploadField, String),
+    SettingsUploadKind(String),
 }
 
 #[derive(Clone)]
@@ -481,6 +487,15 @@ enum SettingsSection {
     Appearance,
     Notifications,
     Networks,
+    Upload,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadField {
+    Url,
+    Token,
+    Field,
+    ResponseKey,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -584,6 +599,10 @@ struct App {
     emoji_picker: Option<EmojiPickerState>,
     message_context: Option<MessageContextState>,
     member_context: Option<MemberContextState>,
+    /// True while a FILEHOST upload is in flight (disables the attach button).
+    uploading: bool,
+    /// Active file-upload backend config (server FILEHOST vs custom HTTP).
+    upload_cfg: config::UploadConfig,
 }
 
 #[derive(Default)]
@@ -713,6 +732,7 @@ impl Default for App {
                 font_size_scale: None,
                 highlight_keywords: Vec::new(),
                 ignored_nicks: Vec::new(),
+                upload: config::UploadConfig::default(),
             },
             settings_section: SettingsSection::Appearance,
             settings_kw_input: String::new(),
@@ -726,6 +746,8 @@ impl Default for App {
             emoji_picker: None,
             message_context: None,
             member_context: None,
+            uploading: false,
+            upload_cfg: config::UploadConfig::default(),
         };
 
         match config::load() {
@@ -857,6 +879,7 @@ fn build_app_from_cfg(
         theme_name,
         highlight_keywords,
         ignored_nicks,
+        upload_cfg: cfg.upload.clone(),
         ..base
     }
 }
@@ -1478,6 +1501,58 @@ impl App {
                 self.media_cache.insert(fetched.url, fetched.state);
                 Task::none()
             }
+            Message::AttachFilePressed => {
+                if self.uploading || !self.has_upload_target() {
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::FilePicked,
+                )
+            }
+            Message::FilePicked(None) => Task::none(),
+            Message::FilePicked(Some(path)) => match self.resolve_upload_job() {
+                Ok(Some(job)) => {
+                    self.uploading = true;
+                    Task::perform(run_upload(job, path), Message::UploadFinished)
+                }
+                Ok(None) => Task::none(),
+                Err(msg) => {
+                    let now = self.now;
+                    let i = self.selected;
+                    self.channels[i].messages.push(system_line(&msg, now));
+                    Task::none()
+                }
+            },
+            Message::UploadFinished(result) => {
+                self.uploading = false;
+                match result {
+                    Ok(url) => {
+                        if self.input.is_empty() {
+                            self.input = url;
+                        } else {
+                            if !self.input.ends_with(' ') {
+                                self.input.push(' ');
+                            }
+                            self.input.push_str(&url);
+                        }
+                        iced::widget::operation::focus(COMPOSE_INPUT_ID)
+                    }
+                    Err(e) => {
+                        let now = self.now;
+                        let i = self.selected;
+                        self.channels[i]
+                            .messages
+                            .push(system_line(&format!("upload failed: {e}"), now));
+                        Task::none()
+                    }
+                }
+            }
             Message::Key(ev) => self.handle_key(ev),
             Message::PaletteQuery(q) => {
                 self.palette_query = q;
@@ -1723,6 +1798,38 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::SettingsUploadUseCustom(b) => {
+                self.settings_draft.upload.use_custom = b;
+                if b && self.settings_draft.upload.custom.is_none() {
+                    self.settings_draft.upload.custom = Some(config::CustomUploader::default());
+                }
+                Task::none()
+            }
+            Message::SettingsUploadField(field, val) => {
+                let c = self
+                    .settings_draft
+                    .upload
+                    .custom
+                    .get_or_insert_with(config::CustomUploader::default);
+                match field {
+                    UploadField::Url => c.url = val,
+                    UploadField::Token => {
+                        c.token = if val.is_empty() { None } else { Some(val) }
+                    }
+                    UploadField::Field => c.field = val,
+                    UploadField::ResponseKey => c.response_key = val,
+                }
+                Task::none()
+            }
+            Message::SettingsUploadKind(kind) => {
+                let c = self
+                    .settings_draft
+                    .upload
+                    .custom
+                    .get_or_insert_with(config::CustomUploader::default);
+                c.response_kind = kind;
+                Task::none()
+            }
             Message::EmojiPickerToggle => {
                 if self.emoji_picker.is_some() {
                     self.emoji_picker = None;
@@ -1915,6 +2022,7 @@ impl App {
             font_size_scale: FONT_SCALE.get().copied(),
             highlight_keywords: self.highlight_keywords.clone(),
             ignored_nicks: ignored,
+            upload: self.upload_cfg.clone(),
         }
     }
 
@@ -1955,6 +2063,7 @@ impl App {
             }
         }
         self.highlight_keywords = self.settings_draft.highlight_keywords.clone();
+        self.upload_cfg = self.settings_draft.upload.clone();
         self.settings_save_error = None;
         self.settings_save_info = Some(
             "saved · font, font scale and network changes need a restart"
@@ -2133,6 +2242,68 @@ impl App {
             tasks.push(Task::perform(fetch_media(url), Message::MediaFetched));
         }
         Task::batch(tasks)
+    }
+
+    // True when there's a usable upload destination for the attach button:
+    // either a configured custom uploader, or a FILEHOST endpoint advertised
+    // by the current channel's network.
+    fn has_upload_target(&self) -> bool {
+        if self.upload_cfg.use_custom {
+            self.upload_cfg
+                .custom
+                .as_ref()
+                .is_some_and(|c| !c.url.trim().is_empty())
+        } else {
+            self.channels
+                .get(self.selected)
+                .and_then(|ch| self.net(ch.network_id))
+                .is_some_and(|n| n.isupport.filehost.is_some())
+        }
+    }
+
+    // Build the concrete upload job for the active backend. Ok(None) means
+    // "no target configured"; Err(msg) means a target exists but can't be used
+    // (e.g. an insecure endpoint over TLS) and msg should be shown to the user.
+    fn resolve_upload_job(&self) -> Result<Option<UploadJob>, String> {
+        if self.upload_cfg.use_custom {
+            let Some(c) = self.upload_cfg.custom.as_ref() else {
+                return Ok(None);
+            };
+            if c.url.trim().is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(UploadJob::Custom {
+                url: c.url.trim().to_string(),
+                token: c.token.clone().filter(|t| !t.is_empty()),
+                field: c.field.clone(),
+                response_kind: c.response_kind.clone(),
+                response_key: c.response_key.clone(),
+            }));
+        }
+        let Some(ch) = self.channels.get(self.selected) else {
+            return Ok(None);
+        };
+        let Some(net) = self.net(ch.network_id) else {
+            return Ok(None);
+        };
+        let Some(endpoint) = net.isupport.filehost.clone() else {
+            return Ok(None);
+        };
+        if net.cfg.use_tls && endpoint.starts_with("http://") {
+            return Err(
+                "upload refused: FILEHOST endpoint is plaintext http:// over a TLS connection"
+                    .into(),
+            );
+        }
+        let auth = {
+            let pass = net.cfg.sasl_password.clone().unwrap_or_default();
+            if pass.is_empty() {
+                None
+            } else {
+                Some((net.cfg.sasl_user().to_string(), pass))
+            }
+        };
+        Ok(Some(UploadJob::Filehost { endpoint, auth }))
     }
 
     fn server_for_log(&self) -> String {
@@ -2890,6 +3061,12 @@ impl App {
             format!("caps acked ({}): {}", caps.len(), caps.join(" "))
         };
         self.channels[i].messages.push(system_line(&line, now));
+        let filehost = self.net(net_id).and_then(|n| n.isupport.filehost.clone());
+        let fh_line = match filehost {
+            Some(url) => format!("FILEHOST: {url}"),
+            None => "FILEHOST: not advertised".to_string(),
+        };
+        self.channels[i].messages.push(system_line(&fh_line, now));
     }
 
     fn cmd_history(&mut self, now: Instant) {
@@ -4307,6 +4484,7 @@ impl App {
             self.settings_section_button("Appearance", SettingsSection::Appearance),
             self.settings_section_button("Notifications", SettingsSection::Notifications),
             self.settings_section_button("Networks", SettingsSection::Networks),
+            self.settings_section_button("Upload", SettingsSection::Upload),
         ]
         .spacing(tok::S1)
         .width(Length::Fixed(150.0));
@@ -4315,6 +4493,7 @@ impl App {
             SettingsSection::Appearance => self.settings_appearance_section(),
             SettingsSection::Notifications => self.settings_notifications_section(),
             SettingsSection::Networks => self.settings_networks_section(),
+            SettingsSection::Upload => self.settings_upload_section(),
         };
         let section_scroll = scrollable(
             container(section)
@@ -4556,6 +4735,98 @@ matched on word boundaries.",
         ]
         .spacing(tok::S3)
         .into()
+    }
+
+    fn settings_upload_section(&self) -> Element<'_, Message> {
+        let up = &self.settings_draft.upload;
+        let use_custom = up.use_custom;
+
+        let toggle: Element<Message> = checkbox(use_custom)
+            .label("Use a custom uploader (pastebin / HTTP) instead of the server")
+            .on_toggle(Message::SettingsUploadUseCustom)
+            .text_size(sz(11.0))
+            .size(14.0)
+            .into();
+
+        let intro = text(
+            "Where the attach button sends files. By default it uses the IRC server's \
+advertised FILEHOST endpoint; enable a custom uploader to use your own service \
+(e.g. a pastebin REST API).",
+        )
+        .size(sz(10.0))
+        .color(tok::text_faint());
+
+        let mut col = column![settings_section_header("Upload"), intro, toggle].spacing(tok::S3);
+
+        if use_custom {
+            let c = up.custom.clone().unwrap_or_default();
+            let url_input = text_input("https://paste.example.com/api/upload", &c.url)
+                .on_input(|v| Message::SettingsUploadField(UploadField::Url, v))
+                .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+                .size(sz(11.0))
+                .width(Length::Fixed(360.0))
+                .style(|_, status| input_style(status));
+            let token_input =
+                text_input("optional — sent as Authorization: Bearer", &c.token.clone().unwrap_or_default())
+                    .on_input(|v| Message::SettingsUploadField(UploadField::Token, v))
+                    .secure(true)
+                    .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+                    .size(sz(11.0))
+                    .width(Length::Fixed(360.0))
+                    .style(|_, status| input_style(status));
+            let field_input = text_input("file  (empty = raw body)", &c.field)
+                .on_input(|v| Message::SettingsUploadField(UploadField::Field, v))
+                .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+                .size(sz(11.0))
+                .width(Length::Fixed(220.0))
+                .style(|_, status| input_style(status));
+            let kinds = vec!["json".to_string(), "location".to_string(), "text".to_string()];
+            let kind_pick = pick_list(kinds, Some(c.response_kind.clone()), Message::SettingsUploadKind)
+                .text_size(sz(11.0))
+                .width(Length::Fixed(140.0));
+            let key_input = text_input("url", &c.response_key)
+                .on_input(|v| Message::SettingsUploadField(UploadField::ResponseKey, v))
+                .padding(pad(tok::S2 as f32, tok::S3, tok::S2 as f32, tok::S3))
+                .size(sz(11.0))
+                .width(Length::Fixed(140.0))
+                .style(|_, status| input_style(status));
+
+            col = col.push(settings_row("Upload URL", url_input.into()));
+            col = col.push(settings_row("Bearer token", token_input.into()));
+            col = col.push(settings_row("Multipart field", field_input.into()));
+            col = col.push(settings_row("Response", kind_pick.into()));
+            let kind = c.response_kind.trim();
+            if kind == "json" || kind.is_empty() {
+                col = col.push(settings_row("JSON key", key_input.into()));
+            }
+            col = col.push(
+                text(
+                    "Tip: for inline image previews, use the response key that returns the \
+direct/raw file URL.",
+                )
+                .size(sz(10.0))
+                .color(tok::text_faint()),
+            );
+        } else {
+            let status = self
+                .channels
+                .get(self.selected)
+                .and_then(|ch| self.net(ch.network_id))
+                .and_then(|n| n.isupport.filehost.clone());
+            let line = match status {
+                Some(u) => format!("Server FILEHOST: {u}"),
+                None => "Server FILEHOST: not advertised by the current network".to_string(),
+            };
+            col = col.push(text(line).size(sz(11.0)).color(tok::text_mid()));
+        }
+
+        col = col.push(sp(0, tok::S2));
+        col = col.push(
+            text("Saved on Save · applies immediately.")
+                .size(sz(10.0))
+                .color(tok::text_faint()),
+        );
+        col.into()
     }
 
     fn settings_networks_section(&self) -> Element<'_, Message> {
@@ -5231,8 +5502,32 @@ matched on word boundaries.",
         )
         .interaction(iced::mouse::Interaction::Pointer);
 
+        // Attach button only when there's a usable upload target (custom
+        // uploader configured, or the network advertises FILEHOST).
+        let can_attach = self.has_upload_target();
+        let attach_btn: Element<Message> = if can_attach {
+            let glyph = if self.uploading { "⋯" } else { "📎" };
+            let press = (!self.uploading).then_some(Message::AttachFilePressed);
+            mouse_area(
+                button(
+                    container(text(glyph).size(sz(15.0)).color(tok::text_muted()).font(regular()))
+                        .width(Length::Fixed(36.0))
+                        .height(Length::Fixed(36.0))
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center),
+                )
+                .on_press_maybe(press)
+                .padding(0)
+                .style(|_theme, status| ghost_button_style(status)),
+            )
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
+        } else {
+            sp(0, 0).into()
+        };
+
         let input = container(
-            row![text_field, emoji_btn, send_btn]
+            row![text_field, attach_btn, emoji_btn, send_btn]
                 .spacing(tok::S2)
                 .align_y(iced::Alignment::Center),
         )
@@ -5728,8 +6023,8 @@ fn palette_input_style(
 }
 
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_PREVIEW_W: f32 = 480.0;
-const MAX_PREVIEW_H: f32 = 360.0;
+const MAX_PREVIEW_W: f32 = 280.0;
+const MAX_PREVIEW_H: f32 = 200.0;
 
 fn open_url(url: &str) {
     use std::process::Command;
@@ -5810,6 +6105,219 @@ fn extract_urls(body: &str) -> Vec<String> {
 
 const MAX_HTML_BYTES: usize = 256 * 1024;
 
+// Strip characters that would break the Content-Disposition header (quotes,
+// backslashes, control chars / CRLF header injection).
+fn header_safe_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .collect();
+    if cleaned.is_empty() { "file".into() } else { cleaned }
+}
+
+// A resolved upload destination for one file.
+enum UploadJob {
+    // IRC server's advertised FILEHOST endpoint.
+    Filehost {
+        endpoint: String,
+        auth: Option<(String, String)>,
+    },
+    // User-configured custom HTTP uploader (e.g. a pastebin).
+    Custom {
+        url: String,
+        token: Option<String>,
+        field: String,
+        response_kind: String,
+        response_key: String,
+    },
+}
+
+async fn run_upload(job: UploadJob, path: std::path::PathBuf) -> Result<String, String> {
+    match job {
+        UploadJob::Filehost { endpoint, auth } => upload_file(endpoint, auth, path).await,
+        UploadJob::Custom {
+            url,
+            token,
+            field,
+            response_kind,
+            response_key,
+        } => upload_custom(url, token, field, response_kind, response_key, path).await,
+    }
+}
+
+// Upload to a custom HTTP endpoint. Sends the file either as a multipart form
+// field (when `field` is non-empty) or as a raw request body, optionally with
+// a Bearer token, then extracts the resulting URL from the response per
+// `response_kind` ("json" + `response_key`, "location" header, or "text").
+async fn upload_custom(
+    url: String,
+    token: Option<String>,
+    field: String,
+    response_kind: String,
+    response_key: String,
+    path: std::path::PathBuf,
+) -> Result<String, String> {
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("read file: {e}"))?;
+    if bytes.is_empty() {
+        return Err("file is empty".into());
+    }
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(header_safe_filename)
+        .unwrap_or_else(|| "file".into());
+    let mime = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("murmur/0.2")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.post(&url);
+    if let Some(t) = token.as_ref().filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    if field.trim().is_empty() {
+        req = req
+            .header(reqwest::header::CONTENT_TYPE, &mime)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            )
+            .body(bytes);
+    } else {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(&mime)
+            .map_err(|e| e.to_string())?;
+        let form = reqwest::multipart::Form::new().part(field.trim().to_string(), part);
+        req = req.multipart(form);
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(160)
+            .collect();
+        return Err(if snippet.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            format!("HTTP {} — {snippet}", status.as_u16())
+        });
+    }
+
+    match response_kind.trim() {
+        "location" => {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or("response had no Location header")?;
+            Ok(resolve_url(&url, loc))
+        }
+        "text" => {
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            let u = body.trim();
+            if u.is_empty() {
+                Err("empty response body".into())
+            } else {
+                Ok(resolve_url(&url, u))
+            }
+        }
+        _ => {
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            let v: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| format!("parse json: {e}"))?;
+            let key = if response_key.trim().is_empty() {
+                "url"
+            } else {
+                response_key.trim()
+            };
+            let found = v
+                .get(key)
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("key {key:?} not found in JSON response"))?;
+            Ok(resolve_url(&url, found))
+        }
+    }
+}
+
+// IRCv3 FILEHOST (soju.im/FILEHOST) upload: POST the raw file bytes to the
+// advertised endpoint with the same credentials used on the IRC connection,
+// then read the uploaded file's URL from the 201 `Location` header.
+async fn upload_file(
+    endpoint: String,
+    auth: Option<(String, String)>,
+    path: std::path::PathBuf,
+) -> Result<String, String> {
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("read file: {e}"))?;
+    if bytes.is_empty() {
+        return Err("file is empty".into());
+    }
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(header_safe_filename)
+        .unwrap_or_else(|| "file".into());
+    let mime = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("murmur/0.2")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, &mime)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(bytes);
+    if let Some((user, pass)) = auth {
+        req = req.basic_auth(user, Some(pass));
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status.as_u16() != 201 {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet: String = snippet.chars().take(120).collect();
+        return Err(if snippet.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            format!("HTTP {} — {snippet}", status.as_u16())
+        });
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or("server returned 201 without a Location header")?;
+    Ok(resolve_url(&endpoint, location))
+}
+
 async fn fetch_media(url: String) -> FetchedMedia {
     let make_err = |e: String| FetchedMedia { url: url.clone(), state: MediaState::Error(e) };
 
@@ -5883,7 +6391,31 @@ async fn fetch_media(url: String) -> FetchedMedia {
         // card. Real pages with a <title> (wikis, blogs without og:) get
         // a link card instead, so we don't hijack the preview with their
         // logo or footer image.
-        if !has_og_or_twitter && !has_title {
+        //
+        // Exception: a paste/file viewer whose <title> is literally an image
+        // filename (e.g. "Screenshot ….png") is an image page even though it
+        // has a title — follow its embedded <img> too. The extension check
+        // keeps real articles ("Breaking News") as link cards.
+        // Match an image extension anywhere in the title so a site-name suffix
+        // (e.g. "shot.png — pastebin") still counts. Followed by end or a
+        // non-alphanumeric so "report.pngx" or prose like "the apng format"
+        // don't trip it.
+        let title_is_image_name = meta
+            .get("title")
+            .map(|t| {
+                let t = t.to_ascii_lowercase();
+                [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif", ".svg"]
+                    .iter()
+                    .any(|ext| match t.find(ext) {
+                        Some(i) => t[i + ext.len()..]
+                            .chars()
+                            .next()
+                            .map_or(true, |c| !c.is_alphanumeric()),
+                        None => false,
+                    })
+            })
+            .unwrap_or(false);
+        if (!has_og_or_twitter && !has_title) || title_is_image_name {
             if let Some(img_src) = extract_first_img_src(&html) {
                 let img_url = resolve_url(&url, &img_src);
                 if let Ok((handle, w, h)) = fetch_image(&client, &img_url).await {

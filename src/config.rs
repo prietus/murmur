@@ -19,6 +19,63 @@ pub struct AppConfig {
     pub highlight_keywords: Vec<String>,
     #[serde(default)]
     pub ignored_nicks: Vec<String>,
+    #[serde(default)]
+    pub upload: UploadConfig,
+}
+
+// File-upload backend selection. When `use_custom` is false, uploads use the
+// IRC server's advertised FILEHOST endpoint (soju.im/FILEHOST). When true,
+// they go to the user-configured `custom` HTTP uploader (e.g. a pastebin).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UploadConfig {
+    #[serde(default)]
+    pub use_custom: bool,
+    #[serde(default)]
+    pub custom: Option<CustomUploader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomUploader {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Multipart form field name for the file. Empty = send the raw bytes as
+    /// the request body instead of a multipart form.
+    #[serde(default = "default_upload_field")]
+    pub field: String,
+    /// How to read the resulting URL from the response: "json", "location"
+    /// (header), or "text" (whole body).
+    #[serde(default = "default_response_kind")]
+    pub response_kind: String,
+    /// JSON key holding the URL when `response_kind == "json"`.
+    #[serde(default = "default_response_key")]
+    pub response_key: String,
+}
+
+impl Default for CustomUploader {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            token: None,
+            field: default_upload_field(),
+            response_kind: default_response_kind(),
+            response_key: default_response_key(),
+        }
+    }
+}
+
+fn default_upload_field() -> String {
+    "file".into()
+}
+fn default_response_kind() -> String {
+    "json".into()
+}
+fn default_response_key() -> String {
+    "url".into()
 }
 
 // Per-network identity + connection settings.
@@ -155,6 +212,7 @@ impl LegacyAppConfig {
             font_size_scale: self.font_size_scale,
             highlight_keywords: Vec::new(),
             ignored_nicks: Vec::new(),
+            upload: UploadConfig::default(),
         }
     }
 }

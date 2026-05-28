@@ -52,6 +52,9 @@ pub struct ISupport {
     pub casemapping: String,
     /// `NETWORK=<name>` — human-readable network name.
     pub network: Option<String>,
+    /// `soju.im/FILEHOST` / `draft/FILEHOST` — HTTP upload endpoint URI for
+    /// the IRCv3 file-upload (FILEHOST) extension. `None` if unadvertised.
+    pub filehost: Option<String>,
 }
 
 /// One entry from a NAMES reply (or a JOIN). Enriched with `multi-prefix`
@@ -1604,6 +1607,13 @@ fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
             let new = value.map(str::to_string);
             if isupport.network != new {
                 isupport.network = new;
+                return true;
+            }
+        }
+        "soju.im/FILEHOST" | "draft/FILEHOST" => {
+            let new = value.map(str::to_string);
+            if isupport.filehost != new {
+                isupport.filehost = new;
                 return true;
             }
         }
