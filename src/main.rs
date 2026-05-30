@@ -443,6 +443,9 @@ enum Message {
     AttachFilePressed,
     FilePicked(Option<std::path::PathBuf>),
     UploadFinished(Result<String, String>),
+    FileHovered,
+    FileDropped(std::path::PathBuf),
+    FilesHoveredLeft,
     SettingsUploadUseCustom(bool),
     SettingsUploadField(UploadField, String),
     SettingsUploadKind(String),
@@ -603,6 +606,9 @@ struct App {
     uploading: bool,
     /// Active file-upload backend config (server FILEHOST vs custom HTTP).
     upload_cfg: config::UploadConfig,
+    /// True while a file is being dragged over the window. Drives the
+    /// composer's drop-hint border.
+    file_hover: bool,
 }
 
 #[derive(Default)]
@@ -748,6 +754,7 @@ impl Default for App {
             member_context: None,
             uploading: false,
             upload_cfg: config::UploadConfig::default(),
+            file_hover: false,
         };
 
         match config::load() {
@@ -1516,19 +1523,24 @@ impl App {
                 )
             }
             Message::FilePicked(None) => Task::none(),
-            Message::FilePicked(Some(path)) => match self.resolve_upload_job() {
-                Ok(Some(job)) => {
-                    self.uploading = true;
-                    Task::perform(run_upload(job, path), Message::UploadFinished)
+            Message::FilePicked(Some(path)) => self.start_upload(path),
+            Message::FileHovered => {
+                if !self.uploading && self.has_upload_target() {
+                    self.file_hover = true;
                 }
-                Ok(None) => Task::none(),
-                Err(msg) => {
-                    let now = self.now;
-                    let i = self.selected;
-                    self.channels[i].messages.push(system_line(&msg, now));
-                    Task::none()
+                Task::none()
+            }
+            Message::FilesHoveredLeft => {
+                self.file_hover = false;
+                Task::none()
+            }
+            Message::FileDropped(path) => {
+                self.file_hover = false;
+                if self.uploading {
+                    return Task::none();
                 }
-            },
+                self.start_upload(path)
+            }
             Message::UploadFinished(result) => {
                 self.uploading = false;
                 match result {
@@ -2304,6 +2316,22 @@ impl App {
             }
         };
         Ok(Some(UploadJob::Filehost { endpoint, auth }))
+    }
+
+    fn start_upload(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        match self.resolve_upload_job() {
+            Ok(Some(job)) => {
+                self.uploading = true;
+                Task::perform(run_upload(job, path), Message::UploadFinished)
+            }
+            Ok(None) => Task::none(),
+            Err(msg) => {
+                let now = self.now;
+                let i = self.selected;
+                self.channels[i].messages.push(system_line(&msg, now));
+                Task::none()
+            }
+        }
     }
 
     fn server_for_log(&self) -> String {
@@ -4164,6 +4192,9 @@ impl App {
         subs.push(window::events().filter_map(|(_id, ev)| match ev {
             window::Event::Focused => Some(Message::WindowFocus(true)),
             window::Event::Unfocused => Some(Message::WindowFocus(false)),
+            window::Event::FileHovered(_) => Some(Message::FileHovered),
+            window::Event::FilesHoveredLeft => Some(Message::FilesHoveredLeft),
+            window::Event::FileDropped(path) => Some(Message::FileDropped(path)),
             _ => None,
         }));
 
@@ -5526,12 +5557,21 @@ direct/raw file URL.",
             sp(0, 0).into()
         };
 
+        let dropping = self.file_hover && can_attach && !self.uploading;
         let input = container(
             row![text_field, attach_btn, emoji_btn, send_btn]
                 .spacing(tok::S2)
                 .align_y(iced::Alignment::Center),
         )
-        .padding(pad(tok::S2, tok::S4, tok::S3, tok::S4));
+        .padding(pad(tok::S2, tok::S4, tok::S3, tok::S4))
+        .style(move |_| container::Style {
+            border: Border {
+                color: if dropping { tok::accent() } else { Color::TRANSPARENT },
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        });
 
         let typing_bar: Element<Message> = match self.typing_text() {
             Some(body) => container(
