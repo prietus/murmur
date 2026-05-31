@@ -58,6 +58,7 @@ const MEMBERS_MAX_W: f32 = 200.0;
 
 const PALETTE_INPUT_ID: &str = "palette-input";
 const COMPOSE_INPUT_ID: &str = "compose-input";
+const SEARCH_INPUT_ID: &str = "search-input";
 const EMOJI_PICKER_INPUT_ID: &str = "emoji-picker-input";
 const PALETTE_W: f32 = 520.0;
 const PALETTE_MAX_ITEMS: usize = 8;
@@ -449,6 +450,8 @@ enum Message {
     SettingsUploadUseCustom(bool),
     SettingsUploadField(UploadField, String),
     SettingsUploadKind(String),
+    SearchClose,
+    SearchQuery(String),
 }
 
 #[derive(Clone)]
@@ -609,6 +612,14 @@ struct App {
     /// True while a file is being dragged over the window. Drives the
     /// composer's drop-hint border.
     file_hover: bool,
+    /// In-buffer search (⌘F). Highlights case-insensitive matches in
+    /// the currently-selected channel's messages.
+    search: Option<SearchState>,
+}
+
+#[derive(Default)]
+struct SearchState {
+    query: String,
 }
 
 #[derive(Default)]
@@ -670,6 +681,12 @@ struct Channel {
     /// Whether we've already asked the server for initial backlog
     /// (CHATHISTORY LATEST). Set on first self-join to avoid refetching.
     chathistory_requested: bool,
+    /// Index of the first unread message in `messages`. The read-marker
+    /// separator is drawn just above this message. Set when a message
+    /// arrives while the channel is not active+focused; cleared on
+    /// switch-away or window blur (so the next batch of unreads gets a
+    /// fresh anchor).
+    read_marker_idx: Option<usize>,
 }
 
 fn new_row_anim() -> Animation<bool> {
@@ -755,6 +772,7 @@ impl Default for App {
             uploading: false,
             upload_cfg: config::UploadConfig::default(),
             file_hover: false,
+            search: None,
         };
 
         match config::load() {
@@ -907,6 +925,7 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         has_unread: false,
         has_mention: false,
         chathistory_requested: false,
+        read_marker_idx: None,
     }
 }
 
@@ -1378,6 +1397,7 @@ impl App {
             has_unread: false,
             has_mention: false,
             chathistory_requested: false,
+            read_marker_idx: None,
         });
         self.channels.len() - 1
     }
@@ -1501,6 +1521,8 @@ impl App {
                 self.window_focused = focused;
                 if focused {
                     self.clear_active_unread();
+                } else if let Some(ch) = self.channels.get_mut(self.selected) {
+                    ch.read_marker_idx = None;
                 }
                 Task::none()
             }
@@ -1540,6 +1562,16 @@ impl App {
                     return Task::none();
                 }
                 self.start_upload(path)
+            }
+            Message::SearchClose => {
+                self.search = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::SearchQuery(q) => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query = q;
+                }
+                Task::none()
             }
             Message::UploadFinished(result) => {
                 self.uploading = false;
@@ -2123,6 +2155,26 @@ impl App {
             return Task::none();
         }
 
+        // Cmd/Ctrl + F → toggle in-buffer search overlay.
+        let is_cmd_f = matches!(&key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("f"))
+            && (modifiers.command() || modifiers.control());
+        if is_cmd_f {
+            if self.search.is_some() {
+                self.search = None;
+                return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+            }
+            self.search = Some(SearchState::default());
+            return iced::widget::operation::focus(SEARCH_INPUT_ID);
+        }
+
+        // Esc closes the search overlay when active.
+        if self.search.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.search = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
         // Esc closes settings when it's the top-most overlay.
         if self.settings_open
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
@@ -2316,6 +2368,31 @@ impl App {
             }
         };
         Ok(Some(UploadJob::Filehost { endpoint, auth }))
+    }
+
+    /// ASCII-lowercased current search query, if the search overlay is open
+    /// and the query is non-empty after trimming. Used to drive in-message
+    /// highlighting.
+    fn search_query_lower(&self) -> Option<String> {
+        let s = self.search.as_ref()?;
+        let q = s.query.trim();
+        if q.is_empty() {
+            return None;
+        }
+        Some(q.to_ascii_lowercase())
+    }
+
+    fn search_match_count(&self) -> usize {
+        let Some(q) = self.search_query_lower() else {
+            return 0;
+        };
+        let Some(ch) = self.channels.get(self.selected) else {
+            return 0;
+        };
+        ch.messages
+            .iter()
+            .map(|m| m.body.to_ascii_lowercase().matches(q.as_str()).count())
+            .sum()
     }
 
     fn start_upload(&mut self, path: std::path::PathBuf) -> Task<Message> {
@@ -3621,6 +3698,10 @@ impl App {
                     if is_highlight {
                         self.channels[idx].has_mention = true;
                     }
+                    if self.channels[idx].read_marker_idx.is_none() {
+                        self.channels[idx].read_marker_idx =
+                            Some(self.channels[idx].messages.len());
+                    }
                 }
                 let fetch = if is_backlog {
                     Task::none()
@@ -3675,6 +3756,10 @@ impl App {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
+                    }
+                    if self.channels[idx].read_marker_idx.is_none() {
+                        self.channels[idx].read_marker_idx =
+                            Some(self.channels[idx].messages.len());
                     }
                 }
                 let fetch = if is_backlog {
@@ -3957,6 +4042,11 @@ impl App {
     fn set_selected(&mut self, i: usize) {
         if self.selected != i || self.channels[i].fade_baseline.elapsed().as_millis() > FADE_MS * 2 {
             self.channels[i].fade_baseline = Instant::now();
+        }
+        if self.selected != i {
+            if let Some(prev) = self.channels.get_mut(self.selected) {
+                prev.read_marker_idx = None;
+            }
         }
         self.selected = i;
         if self.window_focused {
@@ -5485,6 +5575,12 @@ direct/raw file URL.",
         .width(Fill)
         .anchor_bottom();
 
+        let msg_area: Element<Message> = if self.search.is_some() {
+            stack![msg_area, self.search_overlay()].into()
+        } else {
+            msg_area.into()
+        };
+
         let placeholder = compose_placeholder(&ch.name);
         let has_text = !self.input.trim().is_empty();
 
@@ -5609,11 +5705,20 @@ direct/raw file URL.",
         let mut prev_day: Option<&str> = None;
         let mut prev_nick: Option<&str> = None;
         let mut prev_secs: u64 = 0;
+        let marker_at = ch
+            .read_marker_idx
+            .filter(|&i| i < ch.messages.len());
+        let search_q = self.search_query_lower();
+        let search_q_ref = search_q.as_deref();
 
-        for m in &ch.messages {
+        for (i, m) in ch.messages.iter().enumerate() {
             if prev_day != Some(m.day.as_str()) {
                 out.push(self.day_separator(&m.day));
                 prev_day = Some(m.day.as_str());
+                prev_nick = None;
+            }
+            if marker_at == Some(i) {
+                out.push(self.read_marker_row());
                 prev_nick = None;
             }
 
@@ -5644,7 +5749,7 @@ direct/raw file URL.",
                 1.0
             };
 
-            let line = self.message_line(m, grouped, dim_level, baseline);
+            let line = self.message_line(m, grouped, dim_level, baseline, search_q_ref);
             let line_el: Element<Message> = if let Some(msgid) = m.msgid.clone() {
                 let channel_idx = self.selected;
                 mouse_area(line)
@@ -5699,6 +5804,94 @@ direct/raw file URL.",
         .into()
     }
 
+    fn search_overlay(&self) -> Element<'_, Message> {
+        let s = self.search.as_ref().expect("search_overlay called when closed");
+        let count = self.search_match_count();
+        let count_label: Element<Message> = if s.query.trim().is_empty() {
+            sp(0, 0).into()
+        } else {
+            text(format!("{count}"))
+                .size(sz(11.0))
+                .color(if count == 0 { tok::text_faint() } else { tok::text_muted() })
+                .font(regular())
+                .into()
+        };
+
+        let input = text_input("search this channel…", &s.query)
+            .id(SEARCH_INPUT_ID)
+            .on_input(Message::SearchQuery)
+            .padding(pad(tok::S2, tok::S3, tok::S2, tok::S3))
+            .size(sz(12.0))
+            .width(Length::Fixed(240.0))
+            .style(|_theme, status| input_style(status));
+
+        let close_btn = mouse_area(
+            button(
+                container(text("×").size(sz(14.0)).color(tok::text_muted()).font(regular()))
+                    .width(Length::Fixed(28.0))
+                    .height(Length::Fixed(28.0))
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Center),
+            )
+            .on_press(Message::SearchClose)
+            .padding(0)
+            .style(|_theme, status| ghost_button_style(status)),
+        )
+        .interaction(iced::mouse::Interaction::Pointer);
+
+        let bar = container(
+            row![input, count_label, close_btn]
+                .spacing(tok::S3)
+                .align_y(iced::Alignment::Center),
+        )
+        .padding(pad(tok::S2, tok::S3, tok::S2, tok::S3))
+        .style(|_| container::Style {
+            background: Some(Background::Color(tok::bg_1())),
+            border: Border {
+                color: tok::border(),
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            shadow: Shadow {
+                color: Color { a: 0.35, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 24.0,
+            },
+            ..Default::default()
+        });
+
+        container(bar)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(pad(tok::S3 as f32, tok::S4 as f32, 0.0, 0.0))
+            .into()
+    }
+
+    fn read_marker_row<'a>(&'a self) -> Element<'a, Message> {
+        let accent = tok::accent();
+        let faint_accent = Color { a: 0.45, ..accent };
+        container(
+            row![
+                container(sp(Fill, 1)).style(move |_| container::Style {
+                    background: Some(Background::Color(faint_accent)),
+                    ..Default::default()
+                }),
+                text("new").size(sz(10.0)).color(accent).font(medium()),
+                container(sp(Fill, 1)).style(move |_| container::Style {
+                    background: Some(Background::Color(faint_accent)),
+                    ..Default::default()
+                }),
+            ]
+            .spacing(tok::S3)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(pad(tok::S3 as f32, 0.0, tok::S2 as f32, 0.0))
+        .width(Fill)
+        .into()
+    }
+
     fn day_separator<'a>(&'a self, day: &str) -> Element<'a, Message> {
         let label = day.to_string();
         container(
@@ -5727,6 +5920,7 @@ direct/raw file URL.",
         grouped: bool,
         dim_level: f32,
         baseline: Instant,
+        search_q: Option<&str>,
     ) -> Element<'a, Message> {
         let start = m.inserted_at.max(baseline);
         let age_ms = start.elapsed().as_millis().min(FADE_MS);
@@ -5785,20 +5979,47 @@ direct/raw file URL.",
             spans.push(nick_span);
         }
 
+        let hl_bg = Color { a: 0.55 * alpha, ..tok::accent() };
         for seg in body_segments(&m.body) {
             match seg {
-                BodySeg::Text(t) => spans.push(
-                    iced::widget::span(t.to_string())
-                        .color(text_color)
-                        .font(body_font),
-                ),
-                BodySeg::Url(u) => spans.push(
-                    iced::widget::span(u.to_string())
-                        .color(url_color)
-                        .font(body_font)
-                        .underline(true)
-                        .link(u.to_string()),
-                ),
+                BodySeg::Text(t) => {
+                    let parts = match search_q {
+                        Some(q) => split_on_query(t, q),
+                        None => vec![(t, false)],
+                    };
+                    for (chunk, is_match) in parts {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let mut sp = iced::widget::span(chunk.to_string())
+                            .color(text_color)
+                            .font(body_font);
+                        if is_match {
+                            sp = sp.background(hl_bg);
+                        }
+                        spans.push(sp);
+                    }
+                }
+                BodySeg::Url(u) => {
+                    let parts = match search_q {
+                        Some(q) => split_on_query(u, q),
+                        None => vec![(u, false)],
+                    };
+                    for (chunk, is_match) in parts {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let mut sp = iced::widget::span(chunk.to_string())
+                            .color(url_color)
+                            .font(body_font)
+                            .underline(true)
+                            .link(u.to_string());
+                        if is_match {
+                            sp = sp.background(hl_bg);
+                        }
+                        spans.push(sp);
+                    }
+                }
             }
         }
 
@@ -6081,6 +6302,36 @@ fn open_url(url: &str) {
 enum BodySeg<'a> {
     Text(&'a str),
     Url(&'a str),
+}
+
+/// Splits a string into segments, marking spans that case-insensitively
+/// match `q_lower` (which must already be ASCII-lowercased). ASCII case
+/// folding only — Unicode case mismatches won't match.
+fn split_on_query<'a>(s: &'a str, q_lower: &str) -> Vec<(&'a str, bool)> {
+    if q_lower.is_empty() || s.is_empty() {
+        return vec![(s, false)];
+    }
+    let hay = s.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < s.len() {
+        match hay[cursor..].find(q_lower) {
+            Some(pos) => {
+                let abs = cursor + pos;
+                if abs > cursor {
+                    out.push((&s[cursor..abs], false));
+                }
+                let end = abs + q_lower.len();
+                out.push((&s[abs..end], true));
+                cursor = end;
+            }
+            None => {
+                out.push((&s[cursor..], false));
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Splits a chat body into alternating text / URL segments. URL detection
