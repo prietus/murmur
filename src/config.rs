@@ -104,6 +104,10 @@ pub struct NetworkConfig {
     pub client_cert_pass: Option<String>,
     #[serde(default)]
     pub channels: Vec<String>,
+    /// Buddy nicks tracked via the MONITOR command for online/offline
+    /// presence in the sidebar.
+    #[serde(default)]
+    pub buddies: Vec<String>,
     #[serde(default = "default_true")]
     pub autoconnect: bool,
 }
@@ -124,6 +128,7 @@ impl std::hash::Hash for NetworkConfig {
         self.client_cert_path.hash(state);
         self.client_cert_pass.hash(state);
         self.channels.hash(state);
+        self.buddies.hash(state);
     }
 }
 
@@ -203,6 +208,7 @@ impl LegacyAppConfig {
             client_cert_path: self.client_cert_path,
             client_cert_pass: self.client_cert_pass,
             channels: self.channels,
+            buddies: Vec::new(),
             autoconnect: true,
         };
         AppConfig {

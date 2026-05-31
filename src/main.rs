@@ -105,6 +105,7 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/delete", "delete your last message — or /delete <msgid> for a specific one", false),
     ("/react", "react with emoji: /react <emoji> (on your last received msg) or /react <msgid> <emoji>", true),
     ("/setname", "change your realname mid-session (IRCv3 setname): /setname <new realname>", true),
+    ("/monitor", "buddy presence: /monitor add <nick>, /monitor del <nick>, /monitor list", false),
     ("/msgid", "debug: show msgid of last message — or /msgid <substring> to grep recent ones", false),
     ("/caps", "debug: list IRCv3 capabilities ACKed by the server", false),
 ];
@@ -432,6 +433,8 @@ enum Message {
     MessageContextClose,
     MessageContextDelete,
     MessageContextStartReact,
+    MessageContextStartReply,
+    ReplyDraftCancel,
     MemberContextOpen { nick: String },
     MemberContextClose,
     MemberContextDm,
@@ -441,6 +444,7 @@ enum Message {
     MemberContextVoiceToggle,
     MemberContextKick,
     MemberContextBan,
+    MemberContextBuddyToggle,
     AttachFilePressed,
     FilePicked(Option<std::path::PathBuf>),
     UploadFinished(Result<String, String>),
@@ -556,6 +560,10 @@ struct NetworkState {
     accounts: HashMap<String, String>,
     /// Cached ISUPPORT (005) features for this connection.
     isupport: irc_worker::ISupport,
+    /// True after we've pushed the buddy list to the server with
+    /// `MONITOR +` on this connection. Reset on disconnect so we re-sync
+    /// after reconnecting.
+    monitor_synced: bool,
 }
 
 struct App {
@@ -602,8 +610,14 @@ struct App {
     typing_sent: HashMap<(NetworkId, String), Instant>,
     /// Per-target server-side read marker (timestamp last reported by MARKREAD).
     read_markers: HashMap<(NetworkId, String), String>,
+    /// Presence of monitored buddy nicks: `Some(true)` online, `Some(false)`
+    /// offline, missing = unknown (e.g. server doesn't support MONITOR or
+    /// we haven't synced yet). Keyed by `(NetworkId, lower(nick))`.
+    presence: HashMap<(NetworkId, String), bool>,
     emoji_picker: Option<EmojiPickerState>,
     message_context: Option<MessageContextState>,
+    /// Active threaded-reply draft. Cleared on send/cancel/channel-switch.
+    reply_draft: Option<ReplyDraft>,
     member_context: Option<MemberContextState>,
     /// True while a FILEHOST upload is in flight (disables the attach button).
     uploading: bool,
@@ -638,6 +652,16 @@ struct ReactTarget {
 struct MessageContextState {
     channel_idx: usize,
     msgid: String,
+}
+
+/// Active reply draft. While `Some`, the next outbound PRIVMSG will
+/// carry a `+draft/reply` tag referencing `target_msgid`.
+struct ReplyDraft {
+    channel_idx: usize,
+    target_msgid: String,
+    parent_nick: String,
+    /// Truncated parent body used for the composer chip.
+    preview: String,
 }
 
 struct MemberContextState {
@@ -714,6 +738,9 @@ struct ChatMessage {
     msgid: Option<String>,
     /// Emoji reactions on this message: emoji → set of reactor nicks.
     reactions: HashMap<String, HashSet<String>>,
+    /// `+draft/reply=<parent_msgid>` — present when this message is a
+    /// threaded reply.
+    reply_to_msgid: Option<String>,
 }
 
 impl Default for App {
@@ -766,8 +793,10 @@ impl Default for App {
             typing_observed: HashMap::new(),
             typing_sent: HashMap::new(),
             read_markers: HashMap::new(),
+            presence: HashMap::new(),
             emoji_picker: None,
             message_context: None,
+            reply_draft: None,
             member_context: None,
             uploading: false,
             upload_cfg: config::UploadConfig::default(),
@@ -875,6 +904,7 @@ fn build_app_from_cfg(
             away_nicks: HashSet::new(),
             accounts: HashMap::new(),
             isupport: irc_worker::ISupport::default(),
+            monitor_synced: false,
         });
     }
 
@@ -1047,6 +1077,7 @@ fn message_action_bar<'a>(ctx: &'a MessageContextState) -> Element<'a, Message> 
 
     let _ = ctx;
     let mut items: Vec<Element<Message>> = Vec::new();
+    items.push(make_btn("↳ Reply", Message::MessageContextStartReply));
     items.push(make_btn("☺ React", Message::MessageContextStartReact));
     // Always offer Delete: server enforces ownership/op via FAIL REDACT.
     // Gating on local nick comparison was unreliable across chathistory
@@ -1068,7 +1099,9 @@ fn system_line(body: &str, now: Instant) -> ChatMessage {
         inserted_at: now,
         mono_secs: 0,
         kind: MsgKind::System,
-        msgid: None, reactions: HashMap::new(),
+        msgid: None,
+        reactions: HashMap::new(),
+        reply_to_msgid: None,
     }
 }
 
@@ -1081,7 +1114,9 @@ fn joinpart_line(body: &str, now: Instant) -> ChatMessage {
         inserted_at: now,
         mono_secs: now.elapsed().as_secs(),
         kind: MsgKind::JoinPart,
-        msgid: None, reactions: HashMap::new(),
+        msgid: None,
+        reactions: HashMap::new(),
+        reply_to_msgid: None,
     }
 }
 
@@ -1110,7 +1145,9 @@ fn chat_line_from_meta(
         inserted_at,
         mono_secs: now.elapsed().as_secs(),
         kind,
-        msgid: meta.msgid.clone(), reactions: HashMap::new(),
+        msgid: meta.msgid.clone(),
+        reactions: HashMap::new(),
+        reply_to_msgid: meta.reply_to_msgid.clone(),
     }
 }
 
@@ -1456,11 +1493,27 @@ impl App {
                 let is_status = target.starts_with('&');
 
                 if !is_status {
+                    let reply_to = self
+                        .reply_draft
+                        .as_ref()
+                        .filter(|d| d.channel_idx == self.selected)
+                        .map(|d| d.target_msgid.clone());
                     if let Some(tx) = self.active_net_mut().and_then(|n| n.outgoing.as_mut()) {
-                        let _ = tx.try_send(Outgoing::Privmsg {
-                            target: target.clone(),
-                            text: text.clone(),
-                        });
+                        let outgoing = match reply_to.clone() {
+                            Some(msgid) => Outgoing::PrivmsgReply {
+                                target: target.clone(),
+                                text: text.clone(),
+                                reply_to_msgid: msgid,
+                            },
+                            None => Outgoing::Privmsg {
+                                target: target.clone(),
+                                text: text.clone(),
+                            },
+                        };
+                        let _ = tx.try_send(outgoing);
+                    }
+                    if reply_to.is_some() {
+                        self.reply_draft = None;
                     }
                     let nick = self.current_nickname().unwrap_or_else(|| "you".into());
                     let now = Instant::now();
@@ -1478,7 +1531,9 @@ impl App {
                         inserted_at: now,
                         mono_secs: now.elapsed().as_secs(),
                         kind: MsgKind::Chat,
-                        msgid: None, reactions: HashMap::new(),
+                        msgid: None,
+                        reactions: HashMap::new(),
+                        reply_to_msgid: reply_to,
                     });
                     self.now = now;
                     return fetch;
@@ -1728,6 +1783,7 @@ impl App {
                     client_cert_path: None,
                     client_cert_pass: None,
                     channels: Vec::new(),
+                    buddies: Vec::new(),
                     autoconnect: true,
                 });
                 self.settings_net_idx = self.settings_draft.networks.len() - 1;
@@ -1965,6 +2021,33 @@ impl App {
                     Task::none()
                 }
             }
+            Message::MessageContextStartReply => {
+                if let Some(ctx) = self.message_context.take() {
+                    if let Some(channel) = self.channels.get(ctx.channel_idx) {
+                        if let Some(parent) = channel
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.msgid.as_deref() == Some(ctx.msgid.as_str()))
+                        {
+                            let preview = truncate(parent.body.trim(), 80).to_string();
+                            self.reply_draft = Some(ReplyDraft {
+                                channel_idx: ctx.channel_idx,
+                                target_msgid: ctx.msgid,
+                                parent_nick: parent.nick.clone(),
+                                preview,
+                            });
+                        }
+                    }
+                    iced::widget::operation::focus(COMPOSE_INPUT_ID)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::ReplyDraftCancel => {
+                self.reply_draft = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
             Message::MemberContextOpen { nick } => {
                 self.member_context = Some(MemberContextState {
                     channel_idx: self.selected,
@@ -2035,6 +2118,21 @@ impl App {
                 if let Some(ctx) = self.member_context.take() {
                     let now = Instant::now();
                     self.cmd_ban(true, &ctx.nick, now);
+                }
+                Task::none()
+            }
+            Message::MemberContextBuddyToggle => {
+                if let Some(ctx) = self.member_context.take() {
+                    let now = Instant::now();
+                    let net_id = self.channels[self.selected].network_id;
+                    let already = self
+                        .net(net_id)
+                        .map(|n| {
+                            n.cfg.buddies.iter().any(|b| b.eq_ignore_ascii_case(&ctx.nick))
+                        })
+                        .unwrap_or(false);
+                    let sub = if already { "del" } else { "add" };
+                    self.cmd_monitor(&format!("{sub} {}", ctx.nick), now);
                 }
                 Task::none()
             }
@@ -2204,6 +2302,16 @@ impl App {
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         {
             self.member_context = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
+        // Esc cancels an active reply draft (only when composer is empty
+        // — otherwise users would lose half-typed text trying to escape).
+        if self.reply_draft.is_some()
+            && self.input.is_empty()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.reply_draft = None;
             return iced::widget::operation::focus(COMPOSE_INPUT_ID);
         }
 
@@ -2605,6 +2713,7 @@ impl App {
             "delete" | "redact" => self.cmd_delete(rest, now),
             "react" => self.cmd_react(rest, now),
             "setname" => self.cmd_setname(rest, now),
+            "monitor" | "buddy" => self.cmd_monitor(rest, now),
             "msgid" => self.cmd_msgid(rest, now),
             "caps" => self.cmd_caps(now),
             other => {
@@ -2806,6 +2915,164 @@ impl App {
             return;
         }
         self.send_out(Outgoing::SetName(new.to_string()), now);
+    }
+
+    fn cmd_monitor(&mut self, rest: &str, now: Instant) {
+        let mut parts = rest.split_whitespace();
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let arg = parts.next().unwrap_or("").to_string();
+        let net_id = self.channels[self.selected].network_id;
+        match sub.as_str() {
+            "" | "list" | "l" | "ls" => {
+                let buddies = self
+                    .net(net_id)
+                    .map(|n| n.cfg.buddies.clone())
+                    .unwrap_or_default();
+                if buddies.is_empty() {
+                    self.channels[self.selected]
+                        .messages
+                        .push(system_line("no buddies — /monitor add <nick>", now));
+                    return;
+                }
+                let mut lines: Vec<String> = buddies
+                    .iter()
+                    .map(|b| {
+                        let k = (net_id, b.to_ascii_lowercase());
+                        let state = match self.presence.get(&k) {
+                            Some(true) => "online",
+                            Some(false) => "offline",
+                            None => "?",
+                        };
+                        format!("  {b} — {state}")
+                    })
+                    .collect();
+                lines.insert(0, format!("buddies ({}):", buddies.len()));
+                for l in lines {
+                    self.channels[self.selected]
+                        .messages
+                        .push(system_line(&l, now));
+                }
+            }
+            "add" | "+" => {
+                let nick = arg.trim().to_string();
+                if nick.is_empty() {
+                    self.channels[self.selected]
+                        .messages
+                        .push(system_line("usage: /monitor add <nick>", now));
+                    return;
+                }
+                let already = self
+                    .net(net_id)
+                    .map(|n| n.cfg.buddies.iter().any(|b| b.eq_ignore_ascii_case(&nick)))
+                    .unwrap_or(false);
+                if already {
+                    self.channels[self.selected]
+                        .messages
+                        .push(system_line(&format!("{nick} is already a buddy"), now));
+                    return;
+                }
+                if let Some(net) = self.net_mut(net_id) {
+                    net.cfg.buddies.push(nick.clone());
+                }
+                let supported = self
+                    .net(net_id)
+                    .is_some_and(|n| n.isupport.monitor_limit.is_some());
+                if supported {
+                    if let Some(net) = self.net_mut(net_id) {
+                        if let Some(tx) = net.outgoing.as_mut() {
+                            let _ = tx.try_send(Outgoing::Monitor(
+                                irc_worker::MonitorCmd::Add(vec![nick.clone()]),
+                            ));
+                        }
+                    }
+                }
+                let suffix = match self.persist_config() {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (persist failed: {e})"),
+                };
+                let msg = if supported {
+                    format!("buddy added: {nick}{suffix}")
+                } else {
+                    format!(
+                        "buddy added: {nick} (server doesn't advertise MONITOR — presence won't update){suffix}"
+                    )
+                };
+                self.channels[self.selected]
+                    .messages
+                    .push(system_line(&msg, now));
+            }
+            "del" | "rm" | "remove" | "-" => {
+                let nick = arg.trim().to_string();
+                if nick.is_empty() {
+                    self.channels[self.selected]
+                        .messages
+                        .push(system_line("usage: /monitor del <nick>", now));
+                    return;
+                }
+                let removed = if let Some(net) = self.net_mut(net_id) {
+                    let before = net.cfg.buddies.len();
+                    net.cfg.buddies.retain(|b| !b.eq_ignore_ascii_case(&nick));
+                    before != net.cfg.buddies.len()
+                } else {
+                    false
+                };
+                if !removed {
+                    self.channels[self.selected]
+                        .messages
+                        .push(system_line(&format!("{nick} was not a buddy"), now));
+                    return;
+                }
+                self.presence
+                    .remove(&(net_id, nick.to_ascii_lowercase()));
+                let supported = self
+                    .net(net_id)
+                    .is_some_and(|n| n.isupport.monitor_limit.is_some());
+                if supported {
+                    if let Some(net) = self.net_mut(net_id) {
+                        if let Some(tx) = net.outgoing.as_mut() {
+                            let _ = tx.try_send(Outgoing::Monitor(
+                                irc_worker::MonitorCmd::Del(vec![nick.clone()]),
+                            ));
+                        }
+                    }
+                }
+                let suffix = match self.persist_config() {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (persist failed: {e})"),
+                };
+                self.channels[self.selected]
+                    .messages
+                    .push(system_line(&format!("buddy removed: {nick}{suffix}"), now));
+            }
+            "clear" => {
+                if let Some(net) = self.net_mut(net_id) {
+                    net.cfg.buddies.clear();
+                }
+                self.clear_presence_for(net_id);
+                if let Some(net) = self.net_mut(net_id) {
+                    if let Some(tx) = net.outgoing.as_mut() {
+                        let _ = tx.try_send(Outgoing::Monitor(
+                            irc_worker::MonitorCmd::Clear,
+                        ));
+                    }
+                }
+                let suffix = match self.persist_config() {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (persist failed: {e})"),
+                };
+                self.channels[self.selected]
+                    .messages
+                    .push(system_line(&format!("buddy list cleared{suffix}"), now));
+            }
+            other => {
+                self.channels[self.selected].messages.push(system_line(
+                    &format!(
+                        "unknown subcommand: /monitor {other} — try add | del | list | clear"
+                    ),
+                    now,
+                ));
+            }
+        }
     }
 
     fn cmd_whois(&mut self, rest: &str, now: Instant) {
@@ -3262,7 +3529,9 @@ impl App {
             inserted_at: now,
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Action,
-            msgid: None, reactions: HashMap::new(),
+            msgid: None,
+        reactions: HashMap::new(),
+        reply_to_msgid: None,
         });
     }
 
@@ -3295,7 +3564,9 @@ impl App {
             inserted_at: now,
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Chat,
-            msgid: None, reactions: HashMap::new(),
+            msgid: None,
+        reactions: HashMap::new(),
+        reply_to_msgid: None,
         });
         self.set_selected(idx);
     }
@@ -3646,7 +3917,9 @@ impl App {
             IrcEvent::Disconnected => {
                 if let Some(net) = self.net_mut(network_id) {
                     net.status = ConnStatus::Disconnected;
+                    net.monitor_synced = false;
                 }
+                self.clear_presence_for(network_id);
                 self.push_status_in(network_id, system_line("disconnected", now));
                 Task::none()
             }
@@ -3658,7 +3931,9 @@ impl App {
                 if let Some(net) = self.net_mut(network_id) {
                     net.status = ConnStatus::Connecting;
                     net.last_error = None;
+                    net.monitor_synced = false;
                 }
+                self.clear_presence_for(network_id);
                 Task::none()
             }
             IrcEvent::Privmsg { target, nick, body, meta } => {
@@ -3895,6 +4170,7 @@ impl App {
                 if let Some(net) = self.net_mut(network_id) {
                     net.isupport = snapshot;
                 }
+                self.sync_monitor(network_id);
                 Task::none()
             }
             IrcEvent::TypingChanged { target, nick, state } => {
@@ -4029,7 +4305,70 @@ impl App {
                 self.channels[idx].messages.push(system_line(&body, now));
                 Task::none()
             }
+            IrcEvent::Presence { nicks, online } => {
+                let buddies: HashSet<String> = self
+                    .net(network_id)
+                    .map(|n| n.cfg.buddies.iter().map(|s| s.to_ascii_lowercase()).collect())
+                    .unwrap_or_default();
+                let mut returned: Vec<String> = Vec::new();
+                for nick in nicks {
+                    let key = nick.to_ascii_lowercase();
+                    let was = self.presence.insert((network_id, key.clone()), online);
+                    // Notify on transition from offline (or unknown) to online,
+                    // but only for nicks the user actually marked as buddies
+                    // — protects against MONITOR S responses being noisy.
+                    if online
+                        && was != Some(true)
+                        && buddies.contains(&key)
+                        && !self.is_actively_viewing(network_id, &nick)
+                    {
+                        returned.push(nick.clone());
+                    }
+                }
+                for nick in &returned {
+                    notify(format!("{nick} is online"), String::new());
+                }
+                Task::none()
+            }
         }
+    }
+
+    // Push `MONITOR + a,b,c` once per connection after we see ISUPPORT
+    // advertise MONITOR support and the buddy list isn't empty.
+    fn sync_monitor(&mut self, network_id: NetworkId) {
+        let net = match self.net(network_id) {
+            Some(n) => n,
+            None => return,
+        };
+        if net.monitor_synced {
+            return;
+        }
+        if net.isupport.monitor_limit.is_none() {
+            return;
+        }
+        let buddies: Vec<String> = net
+            .cfg
+            .buddies
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if buddies.is_empty() {
+            if let Some(net) = self.net_mut(network_id) {
+                net.monitor_synced = true;
+            }
+            return;
+        }
+        if let Some(net) = self.net_mut(network_id) {
+            if let Some(tx) = net.outgoing.as_mut() {
+                let _ = tx.try_send(Outgoing::Monitor(irc_worker::MonitorCmd::Add(buddies)));
+            }
+            net.monitor_synced = true;
+        }
+    }
+
+    fn clear_presence_for(&mut self, network_id: NetworkId) {
+        self.presence.retain(|(nid, _), _| *nid != network_id);
     }
 
     // Resolve a channel name in the *active* network, creating it if needed.
@@ -4046,6 +4385,15 @@ impl App {
         if self.selected != i {
             if let Some(prev) = self.channels.get_mut(self.selected) {
                 prev.read_marker_idx = None;
+            }
+            // Reply draft is anchored to a specific channel — drop it when
+            // the user navigates away so they don't send the wrong tag.
+            if self
+                .reply_draft
+                .as_ref()
+                .is_some_and(|d| d.channel_idx == self.selected)
+            {
+                self.reply_draft = None;
             }
         }
         self.selected = i;
@@ -5363,12 +5711,17 @@ direct/raw file URL.",
             .map(|(i, ch)| self.channel_row(i, ch))
             .collect();
 
-        let list = scrollable(
+        let mut scroll_children: Vec<Element<Message>> = Vec::new();
+        scroll_children.push(
             column(items)
                 .spacing(0)
-                .padding(pad(tok::S1 as f32, tok::S1 as f32, tok::S2 as f32, tok::S1 as f32)),
-        )
-        .height(Fill);
+                .padding(pad(tok::S1 as f32, tok::S1 as f32, tok::S2 as f32, tok::S1 as f32))
+                .into(),
+        );
+        if let Some(buddies_el) = self.buddy_section() {
+            scroll_children.push(buddies_el);
+        }
+        let list = scrollable(column(scroll_children).spacing(0)).height(Fill);
 
         container(
             container(column![networks_section, list].spacing(0))
@@ -5383,6 +5736,128 @@ direct/raw file URL.",
         .height(Fill)
         .clip(true)
         .into()
+    }
+
+    fn buddy_section(&self) -> Option<Element<'_, Message>> {
+        let active = self.active?;
+        let net = self.net(active)?;
+        if net.cfg.buddies.is_empty() {
+            return None;
+        }
+        let supported = net.isupport.monitor_limit.is_some();
+
+        // Sort: online first, then offline, then unknown; alpha within each.
+        let mut buddies: Vec<&String> = net.cfg.buddies.iter().collect();
+        buddies.sort_by(|a, b| {
+            let pa = self.presence.get(&(active, a.to_ascii_lowercase()));
+            let pb = self.presence.get(&(active, b.to_ascii_lowercase()));
+            let rank = |p: Option<&bool>| match p {
+                Some(true) => 0,
+                Some(false) => 1,
+                None => 2,
+            };
+            rank(pa)
+                .cmp(&rank(pb))
+                .then_with(|| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+        });
+
+        let header = container(
+            text("BUDDIES")
+                .size(sz(10.0))
+                .font(medium())
+                .color(tok::text_faint()),
+        )
+        .padding(pad(tok::S3 as f32, tok::S3 as f32, tok::S1 as f32, tok::S3 as f32));
+
+        let rows: Vec<Element<Message>> = buddies
+            .into_iter()
+            .map(|nick| self.buddy_row(active, nick, supported))
+            .collect();
+
+        Some(
+            column![
+                header,
+                column(rows)
+                    .spacing(0)
+                    .padding(pad(0.0, tok::S1 as f32, tok::S2 as f32, tok::S1 as f32)),
+            ]
+            .spacing(0)
+            .into(),
+        )
+    }
+
+    fn buddy_row<'a>(
+        &'a self,
+        net_id: NetworkId,
+        nick: &'a str,
+        supported: bool,
+    ) -> Element<'a, Message> {
+        let state = self.presence.get(&(net_id, nick.to_ascii_lowercase()));
+        let (dot_color, label_color, label_font) = match state {
+            Some(true) => (tok::accent(), tok::text(), medium()),
+            Some(false) => (
+                Color { a: 0.35, ..tok::text_faint() },
+                Color { a: 0.55, ..tok::text_mid() },
+                regular(),
+            ),
+            None => (
+                Color::TRANSPARENT,
+                tok::text_muted(),
+                regular(),
+            ),
+        };
+        let dot = container(sp(6, 6)).style(move |_| container::Style {
+            background: Some(Background::Color(dot_color)),
+            border: Border {
+                radius: 3.0.into(),
+                color: if state.is_none() && supported {
+                    Color { a: 0.35, ..tok::text_faint() }
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: if state.is_none() && supported { 1.0 } else { 0.0 },
+            },
+            ..Default::default()
+        });
+
+        let row_content = row![
+            container(dot)
+                .width(Length::Fixed(10.0))
+                .align_x(iced::alignment::Horizontal::Center),
+            text(truncate(nick, 18))
+                .size(sz(13.0))
+                .font(label_font)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .color(label_color),
+        ]
+        .spacing(tok::S1)
+        .align_y(iced::Alignment::Center);
+
+        let nick_owned = nick.to_string();
+        let btn = button(row_content)
+            .on_press(Message::StartDmWith(nick_owned))
+            .width(Fill)
+            .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S3 as f32))
+            .style(|_theme, status| match status {
+                button::Status::Hovered => button::Style {
+                    background: Some(Background::Color(tok::bg_hover())),
+                    text_color: tok::text(),
+                    border: Border { radius: 4.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    ..Default::default()
+                },
+                _ => button::Style {
+                    background: Some(Background::Color(Color::TRANSPARENT)),
+                    text_color: tok::text(),
+                    border: Border { radius: 4.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    ..Default::default()
+                },
+            });
+
+        mouse_area(btn)
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
     }
 
     fn channel_row(&self, i: usize, ch: &Channel) -> Element<'_, Message> {
@@ -5682,11 +6157,67 @@ direct/raw file URL.",
             None => sp(0, 0).into(),
         };
 
-        container(column![header, msg_area, typing_bar, input])
+        let reply_chip: Element<Message> = match self.reply_draft.as_ref() {
+            Some(d) if d.channel_idx == self.selected => self.reply_chip(d),
+            _ => sp(0, 0).into(),
+        };
+
+        container(column![header, msg_area, typing_bar, reply_chip, input])
             .width(Fill)
             .height(Fill)
             .style(|_| container::Style {
                 background: Some(Background::Color(tok::bg_1())),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn reply_chip<'a>(&'a self, d: &'a ReplyDraft) -> Element<'a, Message> {
+        let accent = tok::accent();
+        let arrow = text("↳")
+            .size(sz(12.0))
+            .color(accent)
+            .font(medium());
+        let to_label = text(format!("to {}", d.parent_nick))
+            .size(sz(11.0))
+            .color(tok::text_mid())
+            .font(medium());
+        let preview = text(d.preview.clone())
+            .size(sz(11.0))
+            .color(tok::text_muted())
+            .font(regular())
+            .wrapping(iced::widget::text::Wrapping::None);
+        let close = mouse_area(
+            button(
+                container(
+                    text("×")
+                        .size(sz(13.0))
+                        .color(tok::text_muted())
+                        .font(regular()),
+                )
+                .width(Length::Fixed(20.0))
+                .height(Length::Fixed(20.0))
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+            )
+            .on_press(Message::ReplyDraftCancel)
+            .padding(0)
+            .style(|_theme, status| ghost_button_style(status)),
+        )
+        .interaction(iced::mouse::Interaction::Pointer);
+        let bar = row![arrow, to_label, preview, sp(Fill, 0), close]
+            .spacing(tok::S2)
+            .align_y(iced::Alignment::Center);
+        container(bar)
+            .width(Fill)
+            .padding(pad(tok::S1, tok::S4, tok::S1, tok::S4))
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color { a: 0.08, ..tok::accent() })),
+                border: Border {
+                    color: Color { a: 0.35, ..tok::accent() },
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
                 ..Default::default()
             })
             .into()
@@ -5705,6 +6236,9 @@ direct/raw file URL.",
         let mut prev_day: Option<&str> = None;
         let mut prev_nick: Option<&str> = None;
         let mut prev_secs: u64 = 0;
+        // Track the msgid of the last rendered Chat/Action message so that
+        // replies whose parent is immediately above skip the redundant quote.
+        let mut prev_chat_msgid: Option<String> = None;
         let marker_at = ch
             .read_marker_idx
             .filter(|&i| i < ch.messages.len());
@@ -5749,7 +6283,32 @@ direct/raw file URL.",
                 1.0
             };
 
-            let line = self.message_line(m, grouped, dim_level, baseline, search_q_ref);
+            let adjacent_reply = m
+                .reply_to_msgid
+                .as_deref()
+                .is_some_and(|id| prev_chat_msgid.as_deref() == Some(id));
+            let parent_quote: Option<(String, String)> = if adjacent_reply {
+                None
+            } else {
+                m.reply_to_msgid.as_deref().and_then(|id| {
+                    ch.messages.iter().find_map(|p| {
+                        if p.msgid.as_deref() == Some(id) {
+                            Some((p.nick.clone(), truncate(p.body.trim(), 100).to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            };
+            let line = self.message_line(
+                m,
+                grouped,
+                dim_level,
+                baseline,
+                search_q_ref,
+                parent_quote,
+                adjacent_reply,
+            );
             let line_el: Element<Message> = if let Some(msgid) = m.msgid.clone() {
                 let channel_idx = self.selected;
                 mouse_area(line)
@@ -5777,6 +6336,9 @@ direct/raw file URL.",
 
             prev_nick = Some(m.nick.as_str());
             prev_secs = m.mono_secs;
+            if matches!(m.kind, MsgKind::Chat | MsgKind::Action) {
+                prev_chat_msgid = m.msgid.clone();
+            }
         }
         out
     }
@@ -5921,6 +6483,8 @@ direct/raw file URL.",
         dim_level: f32,
         baseline: Instant,
         search_q: Option<&str>,
+        parent_quote: Option<(String, String)>,
+        adjacent_reply: bool,
     ) -> Element<'a, Message> {
         let start = m.inserted_at.max(baseline);
         let age_ms = start.elapsed().as_millis().min(FADE_MS);
@@ -5966,6 +6530,14 @@ direct/raw file URL.",
             .into();
 
         let mut spans: Vec<iced::widget::text::Span<String>> = Vec::new();
+
+        if adjacent_reply {
+            spans.push(
+                iced::widget::span("↳ ".to_string())
+                    .color(Color { a: 0.7 * alpha, ..tok::accent() })
+                    .font(medium()),
+            );
+        }
 
         if !grouped {
             let mut nick_span = iced::widget::span(format!("{} ", nick_short))
@@ -6047,14 +6619,47 @@ direct/raw file URL.",
             })
             .collect();
 
-        let body_col: Element<Message> = if media_els.is_empty() {
-            body_rich.into()
-        } else {
-            let mut col = column![body_rich].spacing(tok::S2);
-            for el in media_els {
-                col = col.push(el);
+        let quote_el: Option<Element<Message>> = parent_quote.map(|(pn, pb)| {
+            let pn_color = nick_color(&pn);
+            let arrow = text("↳")
+                .size(sz(11.0))
+                .color(Color { a: alpha, ..tok::accent() })
+                .font(medium());
+            let nick_lbl = text(pn)
+                .size(sz(11.0))
+                .color(Color { a: alpha, ..pn_color })
+                .font(medium());
+            let body_lbl = text(pb)
+                .size(sz(11.0))
+                .color(Color { a: 0.7 * alpha, ..tok::text_muted() })
+                .font(regular())
+                .wrapping(iced::widget::text::Wrapping::None);
+            row![arrow, nick_lbl, body_lbl]
+                .spacing(tok::S2)
+                .align_y(iced::Alignment::Center)
+                .into()
+        });
+
+        let body_col: Element<Message> = match (quote_el, media_els.is_empty()) {
+            (None, true) => body_rich.into(),
+            (Some(q), true) => column![q, body_rich]
+                .spacing(2)
+                .width(Length::Fill)
+                .into(),
+            (None, false) => {
+                let mut col = column![body_rich].spacing(tok::S2);
+                for el in media_els {
+                    col = col.push(el);
+                }
+                col.width(Length::Fill).into()
             }
-            col.width(Length::Fill).into()
+            (Some(q), false) => {
+                let mut col = column![q, body_rich].spacing(tok::S2);
+                for el in media_els {
+                    col = col.push(el);
+                }
+                col.width(Length::Fill).into()
+            }
         };
 
         container(
@@ -6180,6 +6785,15 @@ direct/raw file URL.",
 
         items.push(member_action_button("Message".into(), Message::MemberContextDm));
         items.push(member_action_button("Whois".into(), Message::MemberContextWhois));
+        let net_id = self.channels[self.selected].network_id;
+        let is_buddy = self
+            .net(net_id)
+            .map(|n| n.cfg.buddies.iter().any(|b| b.eq_ignore_ascii_case(nick)))
+            .unwrap_or(false);
+        items.push(member_action_button(
+            if is_buddy { "Remove buddy".into() } else { "Add buddy".into() },
+            Message::MemberContextBuddyToggle,
+        ));
         items.push(member_action_button(
             if ignored { "Unignore".into() } else { "Ignore".into() },
             Message::MemberContextIgnoreToggle,

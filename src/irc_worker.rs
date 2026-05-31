@@ -55,6 +55,9 @@ pub struct ISupport {
     /// `soju.im/FILEHOST` / `draft/FILEHOST` — HTTP upload endpoint URI for
     /// the IRCv3 file-upload (FILEHOST) extension. `None` if unadvertised.
     pub filehost: Option<String>,
+    /// `MONITOR=<n>` — max number of MONITOR targets we may register.
+    /// `Some(u32::MAX)` means advertised with no explicit cap.
+    pub monitor_limit: Option<u32>,
 }
 
 /// One entry from a NAMES reply (or a JOIN). Enriched with `multi-prefix`
@@ -85,6 +88,9 @@ pub struct MsgMeta {
     /// IRCv3 `account` tag — the sender's services account name when
     /// `account-tag` is negotiated. `None` means logged-out or unsupported.
     pub account: Option<String>,
+    /// `+draft/reply=<msgid>` — when present on a PRIVMSG, this message
+    /// is threaded as a reply to the message with this msgid.
+    pub reply_to_msgid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +117,9 @@ struct MultilineChunk {
 #[derive(Clone)]
 pub enum Outgoing {
     Privmsg { target: String, text: String },
+    /// PRIVMSG carrying a `+draft/reply=<msgid>` tag — threaded reply
+    /// to a prior message in the same target.
+    PrivmsgReply { target: String, text: String, reply_to_msgid: String },
     Action { target: String, text: String },
     Ctcp { target: String, query: String },
     Join(String),
@@ -149,6 +158,19 @@ pub enum Outgoing {
     /// `SETNAME :<new realname>` (IRCv3 setname cap). Changes realname
     /// mid-session without reconnecting.
     SetName(String),
+    /// `MONITOR +/-/C/L/S` — manage the server-side presence subscription
+    /// list. Server replies arrive as RPL_MONONLINE/OFFLINE.
+    Monitor(MonitorCmd),
+}
+
+#[derive(Clone, Debug)]
+pub enum MonitorCmd {
+    /// `MONITOR + nick[,nick,...]` — add targets.
+    Add(Vec<String>),
+    /// `MONITOR - nick[,nick,...]` — remove targets.
+    Del(Vec<String>),
+    /// `MONITOR C` — clear all server-side targets.
+    Clear,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,6 +238,9 @@ pub enum Event {
     Redacted { target: String, msgid: String, by_nick: String, reason: Option<String> },
     /// Inbound emoji reaction (TAGMSG with `+draft/reply` and a body emoji).
     Reaction { target: String, target_msgid: String, nick: String, emoji: String },
+    /// `RPL_MONONLINE` (730) / `RPL_MONOFFLINE` (731) — one or more
+    /// monitored nicks have come online or gone offline.
+    Presence { nicks: Vec<String>, online: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +510,16 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                 Some(Outgoing::Privmsg { target, text }) => {
                                     let _ = sender.send_privmsg(&target, &text);
                                 }
+                                Some(Outgoing::PrivmsgReply { target, text, reply_to_msgid }) => {
+                                    let _ = sender.send(Message {
+                                        tags: Some(vec![Tag(
+                                            "+draft/reply".into(),
+                                            Some(reply_to_msgid),
+                                        )]),
+                                        prefix: None,
+                                        command: Command::PRIVMSG(target, text),
+                                    });
+                                }
                                 Some(Outgoing::Action { target, text }) => {
                                     let wrapped = format!("\x01ACTION {text}\x01");
                                     let _ = sender.send_privmsg(&target, &wrapped);
@@ -578,6 +613,26 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                         "SETNAME".into(),
                                         vec![realname],
                                     ));
+                                }
+                                Some(Outgoing::Monitor(cmd)) => {
+                                    let (op, payload) = match cmd {
+                                        MonitorCmd::Add(t) => ("+", Some(t.join(","))),
+                                        MonitorCmd::Del(t) => ("-", Some(t.join(","))),
+                                        MonitorCmd::Clear => ("C", None),
+                                    };
+                                    // Build argv unless payload is an empty
+                                    // add/del — those are no-ops to skip.
+                                    let argv = match payload {
+                                        Some(p) if p.is_empty() => None,
+                                        Some(p) => Some(vec![op.to_string(), p]),
+                                        None => Some(vec![op.to_string()]),
+                                    };
+                                    if let Some(argv) = argv {
+                                        let _ = sender.send(Command::Raw(
+                                            "MONITOR".into(),
+                                            argv,
+                                        ));
+                                    }
                                 }
                                 Some(Outgoing::React { target, msgid, emoji }) => {
                                     // Reactions piggyback on TAGMSG with
@@ -1075,6 +1130,13 @@ fn extract_meta(
                     }
                 }
             }
+            // `+draft/reply` also rides on TAGMSG to carry reactions;
+            // the TAGMSG path handles that case separately, so this
+            // assignment is harmless there (PRIVMSG/Action are what
+            // actually consume `reply_to_msgid` downstream).
+            "+draft/reply" => {
+                m.reply_to_msgid = v.clone().filter(|s| !s.is_empty());
+            }
             _ => {}
         }
     }
@@ -1339,6 +1401,26 @@ fn translate(
                     topic: strip_irc_formatting(&args[2]),
                 }]
             }
+            Response::RPL_MONONLINE if args.len() >= 2 => {
+                let nicks = parse_monitor_targets(&args[1]);
+                if nicks.is_empty() {
+                    vec![]
+                } else {
+                    vec![Event::Presence { nicks, online: true }]
+                }
+            }
+            Response::RPL_MONOFFLINE if args.len() >= 2 => {
+                let nicks = parse_monitor_targets(&args[1]);
+                if nicks.is_empty() {
+                    vec![]
+                } else {
+                    vec![Event::Presence { nicks, online: false }]
+                }
+            }
+            // 732 RPL_MONLIST and 733 RPL_ENDOFMONLIST: swallowed in v1
+            // (no UI consumer). 734 ERR_MONLISTFULL is surfaced as Notice
+            // by the catch-all arm so the user sees the limit.
+            Response::RPL_MONLIST | Response::RPL_ENDOFMONLIST => vec![],
             _ => format_numeric(code, &args)
                 .or_else(|| render_raw_numeric(code as u16, &args))
                 .map(|text| vec![Event::Notice { from: "*".into(), text, meta }])
@@ -1569,6 +1651,16 @@ fn parse_tagmsg_event(
 
 // Parse a single ISUPPORT token (`KEY` or `KEY=value`) into the snapshot.
 // Returns true when one of the tracked tokens actually changed.
+// Parse the trailing target list from RPL_MONONLINE/731. The IRCv3
+// spec allows `nick[!user@host]` per entry, comma-joined. We keep just
+// the nick — the rest is informational.
+fn parse_monitor_targets(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|t| t.split('!').next().unwrap_or(t).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
     let (key, value) = match tok.split_once('=') {
         Some((k, v)) => (k, Some(v)),
@@ -1614,6 +1706,15 @@ fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
             let new = value.map(str::to_string);
             if isupport.filehost != new {
                 isupport.filehost = new;
+                return true;
+            }
+        }
+        "MONITOR" => {
+            let new = value
+                .and_then(|v| v.parse::<u32>().ok())
+                .or(Some(u32::MAX));
+            if isupport.monitor_limit != new {
+                isupport.monitor_limit = new;
                 return true;
             }
         }
