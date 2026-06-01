@@ -791,6 +791,10 @@ struct Channel {
     /// When `false`, incoming URLs in this channel skip the OpenGraph
     /// unfurl + media fetch pipeline. Session-only; toggle with `/unfurl`.
     unfurl_enabled: bool,
+    /// Client-only tag names (without the `+` prefix) for which we've
+    /// already emitted a "stripped by this network" notice in this
+    /// channel. One-shot per channel per session.
+    clienttag_warned: HashSet<String>,
 }
 
 impl Channel {
@@ -1170,6 +1174,7 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         activity: new_activity_buf(),
         last_bucket_at: Instant::now(),
         unfurl_enabled: true,
+        clienttag_warned: HashSet::new(),
     }
 }
 
@@ -1661,6 +1666,7 @@ impl App {
             activity: new_activity_buf(),
             last_bucket_at: Instant::now(),
             unfurl_enabled: true,
+            clienttag_warned: HashSet::new(),
         });
         self.channels.len() - 1
     }
@@ -1724,6 +1730,16 @@ impl App {
                         .as_ref()
                         .filter(|d| d.channel_idx == self.selected)
                         .map(|d| d.target_msgid.clone());
+                    if reply_to.is_some() {
+                        let channel_idx = self.selected;
+                        let now = Instant::now();
+                        self.note_client_tag_denial(
+                            channel_idx,
+                            "draft/reply",
+                            "Reply threading is stripped by this network — others will see this as a plain message.",
+                            now,
+                        );
+                    }
                     if let Some(tx) = self.active_net_mut().and_then(|n| n.outgoing.as_mut()) {
                         let outgoing = match reply_to.clone() {
                             Some(msgid) => Outgoing::PrivmsgReply {
@@ -3725,6 +3741,35 @@ impl App {
         }
     }
 
+    /// If the current network advertises `CLIENTTAGDENY` and the given
+    /// client-only tag is denied, push a one-shot subtle system_line into
+    /// `channel_idx` so the user knows the action is local-only. No-op on
+    /// repeat calls for the same channel+tag.
+    fn note_client_tag_denial(
+        &mut self,
+        channel_idx: usize,
+        tag: &str,
+        notice: &str,
+        now: Instant,
+    ) {
+        let Some(ch) = self.channels.get(channel_idx) else { return };
+        let net_id = ch.network_id;
+        let denied = self
+            .net(net_id)
+            .map(|n| n.isupport.client_tag_denied(tag))
+            .unwrap_or(false);
+        if !denied {
+            return;
+        }
+        let key = tag.trim_start_matches('+').to_string();
+        if !self.channels[channel_idx].clienttag_warned.insert(key) {
+            return;
+        }
+        self.channels[channel_idx]
+            .messages
+            .push(system_line(notice, now));
+    }
+
     fn cmd_react(&mut self, rest: &str, now: Instant) {
         let Some(ch) = self.channels.get(self.selected) else { return };
         if ch.name.starts_with('&') {
@@ -3766,6 +3811,13 @@ impl App {
             (first.to_string(), second.to_string())
         };
         let _ = net_id; // silence unused
+        let channel_idx = self.selected;
+        self.note_client_tag_denial(
+            channel_idx,
+            "draft/react",
+            "Reactions are stripped by this network — only you will see them.",
+            now,
+        );
         if !self.send_out(
             Outgoing::React { target, msgid, emoji },
             now,

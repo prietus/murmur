@@ -58,6 +58,28 @@ pub struct ISupport {
     /// `MONITOR=<n>` — max number of MONITOR targets we may register.
     /// `Some(u32::MAX)` means advertised with no explicit cap.
     pub monitor_limit: Option<u32>,
+    /// `CLIENTTAGDENY=<list>` — server strips these client-only (`+`) tags
+    /// from outgoing messages. `*` flips `deny_all` on; `-tag` entries
+    /// override into the allow list. See `client_tag_denied()` for lookup.
+    pub client_tag_deny_all: bool,
+    pub client_tag_deny: std::collections::HashSet<String>,
+    pub client_tag_allow: std::collections::HashSet<String>,
+}
+
+impl ISupport {
+    /// True when the server is advertised to strip the given client-only
+    /// tag from outgoing PRIVMSG/TAGMSG. Pass either form: `draft/react`
+    /// or `+draft/react` — the leading `+` is normalized.
+    pub fn client_tag_denied(&self, tag: &str) -> bool {
+        let t = tag.strip_prefix('+').unwrap_or(tag);
+        if self.client_tag_allow.contains(t) {
+            return false;
+        }
+        if self.client_tag_deny_all {
+            return true;
+        }
+        self.client_tag_deny.contains(t)
+    }
 }
 
 /// One entry from a NAMES reply (or a JOIN). Enriched with `multi-prefix`
@@ -1715,6 +1737,35 @@ fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
                 .or(Some(u32::MAX));
             if isupport.monitor_limit != new {
                 isupport.monitor_limit = new;
+                return true;
+            }
+        }
+        "CLIENTTAGDENY" => {
+            let mut deny_all = false;
+            let mut deny: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut allow: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for entry in value.unwrap_or("").split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                if entry == "*" {
+                    deny_all = true;
+                } else if let Some(rest) = entry.strip_prefix('-') {
+                    allow.insert(rest.trim_start_matches('+').to_string());
+                } else {
+                    deny.insert(entry.trim_start_matches('+').to_string());
+                }
+            }
+            if isupport.client_tag_deny_all != deny_all
+                || isupport.client_tag_deny != deny
+                || isupport.client_tag_allow != allow
+            {
+                isupport.client_tag_deny_all = deny_all;
+                isupport.client_tag_deny = deny;
+                isupport.client_tag_allow = allow;
                 return true;
             }
         }
