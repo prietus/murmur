@@ -108,6 +108,10 @@ pub struct NetworkConfig {
     /// presence in the sidebar.
     #[serde(default)]
     pub buddies: Vec<String>,
+    /// Private notes keyed by lowercase nick. Shown in a hover tooltip on
+    /// the member row and editable from the member context menu.
+    #[serde(default)]
+    pub nick_notes: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub autoconnect: bool,
 }
@@ -129,6 +133,10 @@ impl std::hash::Hash for NetworkConfig {
         self.client_cert_pass.hash(state);
         self.channels.hash(state);
         self.buddies.hash(state);
+        for (k, v) in &self.nick_notes {
+            k.hash(state);
+            v.hash(state);
+        }
     }
 }
 
@@ -209,6 +217,7 @@ impl LegacyAppConfig {
             client_cert_pass: self.client_cert_pass,
             channels: self.channels,
             buddies: Vec::new(),
+            nick_notes: std::collections::BTreeMap::new(),
             autoconnect: true,
         };
         AppConfig {

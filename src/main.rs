@@ -2,9 +2,10 @@
 
 mod config;
 mod emoji;
+mod fts;
 mod irc_worker;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ use iced::animation::{Animation, Easing};
 use iced::keyboard;
 use iced::widget::{
     button, checkbox, column, container, image as iced_image, mouse_area, pick_list, radio, row,
-    scrollable, slider, stack, text, text_input, Space,
+    scrollable, slider, stack, text, text_input, tooltip, Space,
 };
 use iced::ContentFit;
 use iced::{
@@ -48,6 +49,21 @@ pub fn local_offset_secs() -> i64 {
 const FADE_MS: u128 = 250;
 const GROUP_SECS: u64 = 300;
 
+/// Activity sparkline: 24 buckets × 5min = 2h sliding window.
+const SPARK_BUCKETS: usize = 24;
+const SPARK_BUCKET_SECS: u64 = 300;
+/// Sparkline lives inside the hover tooltip — sized comfortably for legibility.
+const SPARK_BAR_W: f32 = 3.0;
+const SPARK_GAP: f32 = 1.0;
+const SPARK_H: f32 = 28.0;
+const SPARK_W: f32 = SPARK_BAR_W * SPARK_BUCKETS as f32
+    + SPARK_GAP * (SPARK_BUCKETS as f32 - 1.0);
+
+/// Sparkline tooltip only appears after this dwell time, so a
+/// pass-through hover (moving to click) doesn't pop the panel.
+const CHANNEL_HOVER_TOOLTIP_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 const TIME_W: u32 = 44;
 const NICK_W: u32 = 92;
 
@@ -59,6 +75,8 @@ const MEMBERS_MAX_W: f32 = 200.0;
 const PALETTE_INPUT_ID: &str = "palette-input";
 const COMPOSE_INPUT_ID: &str = "compose-input";
 const SEARCH_INPUT_ID: &str = "search-input";
+const NOTE_INPUT_ID: &str = "note-input";
+const GSEARCH_INPUT_ID: &str = "global-search-input";
 const EMOJI_PICKER_INPUT_ID: &str = "emoji-picker-input";
 const PALETTE_W: f32 = 520.0;
 const PALETTE_MAX_ITEMS: usize = 8;
@@ -106,6 +124,7 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/react", "react with emoji: /react <emoji> (on your last received msg) or /react <msgid> <emoji>", true),
     ("/setname", "change your realname mid-session (IRCv3 setname): /setname <new realname>", true),
     ("/monitor", "buddy presence: /monitor add <nick>, /monitor del <nick>, /monitor list", false),
+    ("/unfurl", "toggle OpenGraph link previews for this channel: /unfurl on|off|toggle", false),
     ("/msgid", "debug: show msgid of last message — or /msgid <substring> to grep recent ones", false),
     ("/caps", "debug: list IRCv3 capabilities ACKed by the server", false),
 ];
@@ -369,6 +388,27 @@ fn blend(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
+/// Stable, session-independent hash of a nick used for privacy masking.
+fn nick_hash(s: &str) -> u32 {
+    let mut h: u32 = 5381;
+    for b in s.as_bytes() {
+        h = h.wrapping_mul(33).wrapping_add(*b as u32);
+    }
+    h
+}
+
+/// Privacy mask: short stable placeholder for a nick (`u·abc`). Lets the
+/// reader follow conversational threads in a screenshot without exposing
+/// real nicks.
+fn privacy_mask(nick: &str) -> String {
+    format!("u·{:03x}", nick_hash(nick) & 0xfff)
+}
+
+/// Apply privacy mask iff privacy_mode is on.
+fn mask_nick(nick: &str, privacy: bool) -> String {
+    if privacy { privacy_mask(nick) } else { nick.to_string() }
+}
+
 fn channel_parts(name: &str) -> (&'static str, String) {
     if let Some(rest) = name.strip_prefix("##") {
         return ("#", rest.to_string());
@@ -445,6 +485,10 @@ enum Message {
     MemberContextKick,
     MemberContextBan,
     MemberContextBuddyToggle,
+    MemberContextNoteOpen,
+    NoteEditorChanged(String),
+    NoteEditorSave,
+    NoteEditorCancel,
     AttachFilePressed,
     FilePicked(Option<std::path::PathBuf>),
     UploadFinished(Result<String, String>),
@@ -456,6 +500,10 @@ enum Message {
     SettingsUploadKind(String),
     SearchClose,
     SearchQuery(String),
+    GlobalSearchQuery(String),
+    GlobalSearchClose,
+    GlobalSearchSelect { network: String, channel: String },
+    DigestDismiss,
 }
 
 #[derive(Clone)]
@@ -585,6 +633,9 @@ struct App {
     palette_query: String,
     palette_cursor: usize,
     hovered_channel: Option<usize>,
+    /// When the current `hovered_channel` started; used to delay the
+    /// activity tooltip so it doesn't flash during pass-through hovers.
+    hovered_channel_at: Option<Instant>,
     hovered_member: Option<usize>,
     hovered_network: Option<NetworkId>,
     tab_state: Option<TabState>,
@@ -629,6 +680,16 @@ struct App {
     /// In-buffer search (⌘F). Highlights case-insensitive matches in
     /// the currently-selected channel's messages.
     search: Option<SearchState>,
+    /// Privacy mode (⌘⇧P). When on, all nicks across the UI are
+    /// replaced with a short stable mask (`u·abc`) to make screenshots
+    /// safe to share. Cleared on next launch.
+    privacy_mode: bool,
+    /// Active private-note editor. While `Some`, a small overlay with a
+    /// text input is rendered over the chat pane to edit the note for
+    /// `nick` on `network_id`. Save persists to config.
+    nick_note_editor: Option<NickNoteEditor>,
+    /// Global FTS5 backlog-search overlay (⌘⇧F). `None` when closed.
+    global_search: Option<GlobalSearchState>,
 }
 
 #[derive(Default)]
@@ -667,6 +728,18 @@ struct ReplyDraft {
 struct MemberContextState {
     channel_idx: usize,
     nick: String,
+}
+
+struct NickNoteEditor {
+    network_id: NetworkId,
+    nick: String,
+    draft: String,
+}
+
+#[derive(Default)]
+struct GlobalSearchState {
+    query: String,
+    hits: Vec<fts::Hit>,
 }
 
 struct TabState {
@@ -711,6 +784,136 @@ struct Channel {
     /// switch-away or window blur (so the next batch of unreads gets a
     /// fresh anchor).
     read_marker_idx: Option<usize>,
+    /// Activity sparkline buckets — oldest at front, newest at back.
+    /// Rotated lazily; `last_bucket_at` marks the start of the back bucket.
+    activity: VecDeque<u32>,
+    last_bucket_at: Instant,
+    /// When `false`, incoming URLs in this channel skip the OpenGraph
+    /// unfurl + media fetch pipeline. Session-only; toggle with `/unfurl`.
+    unfurl_enabled: bool,
+}
+
+impl Channel {
+    fn bump_activity(&mut self, now: Instant) {
+        self.rotate_activity(now);
+        if let Some(last) = self.activity.back_mut() {
+            *last = last.saturating_add(1);
+        }
+    }
+
+    fn rotate_activity(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_bucket_at).as_secs();
+        let advance = (elapsed / SPARK_BUCKET_SECS) as usize;
+        if advance == 0 {
+            return;
+        }
+        let steps = advance.min(SPARK_BUCKETS);
+        for _ in 0..steps {
+            self.activity.pop_front();
+            self.activity.push_back(0);
+        }
+        self.last_bucket_at +=
+            std::time::Duration::from_secs(advance as u64 * SPARK_BUCKET_SECS);
+    }
+
+    /// Returns the visible bucket values, applying lazy rotation virtually
+    /// (no mutation). Length is always `SPARK_BUCKETS`.
+    fn activity_snapshot(&self, now: Instant) -> Vec<u32> {
+        let elapsed = now.saturating_duration_since(self.last_bucket_at).as_secs();
+        let advance = ((elapsed / SPARK_BUCKET_SECS) as usize).min(SPARK_BUCKETS);
+        let mut out: Vec<u32> = self.activity.iter().skip(advance).copied().collect();
+        while out.len() < SPARK_BUCKETS {
+            out.push(0);
+        }
+        out
+    }
+}
+
+fn new_activity_buf() -> VecDeque<u32> {
+    let mut v = VecDeque::with_capacity(SPARK_BUCKETS);
+    for _ in 0..SPARK_BUCKETS {
+        v.push_back(0);
+    }
+    v
+}
+
+/// Render an activity sparkline given a snapshot of bucket counts.
+/// Returns a fixed-width element of `SPARK_W × SPARK_H`. Empty (max=0)
+/// returns an invisible spacer of the same size.
+fn channel_sparkline<'a>(values: &[u32], color: Color) -> Element<'a, Message> {
+    let max = values.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return sp(Length::Fixed(SPARK_W), Length::Fixed(SPARK_H)).into();
+    }
+    let bars: Vec<Element<Message>> = values
+        .iter()
+        .map(|&v| {
+            let h = if v == 0 {
+                0.0
+            } else {
+                ((v as f32 / max as f32) * SPARK_H).max(1.0)
+            };
+            let bar: Element<Message> = if h > 0.0 {
+                container(sp(Length::Fixed(SPARK_BAR_W), Length::Fixed(h)))
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(color)),
+                        border: Border { radius: 1.0.into(), ..Default::default() },
+                        ..Default::default()
+                    })
+                    .into()
+            } else {
+                sp(Length::Fixed(SPARK_BAR_W), Length::Fixed(0.0)).into()
+            };
+            container(bar)
+                .height(Length::Fixed(SPARK_H))
+                .align_y(iced::alignment::Vertical::Bottom)
+                .into()
+        })
+        .collect();
+    iced::widget::row(bars).spacing(SPARK_GAP).into()
+}
+
+/// Hover popup showing the channel's recent activity: sparkline of the
+/// last 2h plus a one-line summary ("N messages · last Xmin").
+fn activity_popup<'a>(
+    snapshot: &[u32],
+    last_msg_ago: Option<u64>,
+) -> Element<'a, Message> {
+    let total: u32 = snapshot.iter().sum();
+    let summary = if total == 0 {
+        "no activity in the last 2h".to_string()
+    } else {
+        let last = match last_msg_ago {
+            Some(s) if s < 60 => "just now".to_string(),
+            Some(s) if s < 3600 => format!("{}m ago", s / 60),
+            Some(s) => format!("{}h ago", s / 3600),
+            None => "—".to_string(),
+        };
+        let plural = if total == 1 { "msg" } else { "msgs" };
+        format!("{} {} · last {} · 2h", total, plural, last)
+    };
+    let spark_color = Color { a: 0.85, ..tok::accent() };
+    container(
+        column![
+            channel_sparkline(snapshot, spark_color),
+            text(summary)
+                .size(sz(10.0))
+                .font(regular())
+                .color(tok::text_mid()),
+        ]
+        .spacing(tok::S1),
+    )
+    .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32))
+    .style(|_| container::Style {
+        background: Some(Background::Color(tok::bg_elev())),
+        border: Border {
+            radius: 6.0.into(),
+            width: 1.0,
+            color: Color { a: 0.5, ..tok::bg_2() },
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 fn new_row_anim() -> Animation<bool> {
@@ -741,6 +944,10 @@ struct ChatMessage {
     /// `+draft/reply=<parent_msgid>` — present when this message is a
     /// threaded reply.
     reply_to_msgid: Option<String>,
+    /// Nicks baked into `body` that should be masked in privacy mode
+    /// (system/join/part/nick-change lines). Empty when no masking is
+    /// needed at render time.
+    mask_nicks: Vec<String>,
 }
 
 impl Default for App {
@@ -764,6 +971,7 @@ impl Default for App {
             palette_query: String::new(),
             palette_cursor: 0,
             hovered_channel: None,
+            hovered_channel_at: None,
             hovered_member: None,
             hovered_network: None,
             tab_state: None,
@@ -802,6 +1010,9 @@ impl Default for App {
             upload_cfg: config::UploadConfig::default(),
             file_hover: false,
             search: None,
+            privacy_mode: false,
+            nick_note_editor: None,
+            global_search: None,
         };
 
         match config::load() {
@@ -956,6 +1167,9 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         has_mention: false,
         chathistory_requested: false,
         read_marker_idx: None,
+        activity: new_activity_buf(),
+        last_bucket_at: Instant::now(),
+        unfurl_enabled: true,
     }
 }
 
@@ -1102,10 +1316,17 @@ fn system_line(body: &str, now: Instant) -> ChatMessage {
         msgid: None,
         reactions: HashMap::new(),
         reply_to_msgid: None,
+        mask_nicks: Vec::new(),
     }
 }
 
-fn joinpart_line(body: &str, now: Instant) -> ChatMessage {
+fn system_line_with_nicks(body: &str, now: Instant, nicks: Vec<String>) -> ChatMessage {
+    let mut m = system_line(body, now);
+    m.mask_nicks = nicks;
+    m
+}
+
+fn joinpart_line(body: &str, now: Instant, nick: Option<String>) -> ChatMessage {
     ChatMessage {
         nick: "*".into(),
         body: body.into(),
@@ -1117,6 +1338,7 @@ fn joinpart_line(body: &str, now: Instant) -> ChatMessage {
         msgid: None,
         reactions: HashMap::new(),
         reply_to_msgid: None,
+        mask_nicks: nick.into_iter().collect(),
     }
 }
 
@@ -1148,6 +1370,7 @@ fn chat_line_from_meta(
         msgid: meta.msgid.clone(),
         reactions: HashMap::new(),
         reply_to_msgid: meta.reply_to_msgid.clone(),
+        mask_nicks: Vec::new(),
     }
 }
 
@@ -1435,6 +1658,9 @@ impl App {
             has_mention: false,
             chathistory_requested: false,
             read_marker_idx: None,
+            activity: new_activity_buf(),
+            last_bucket_at: Instant::now(),
+            unfurl_enabled: true,
         });
         self.channels.len() - 1
     }
@@ -1517,12 +1743,15 @@ impl App {
                     }
                     let nick = self.current_nickname().unwrap_or_else(|| "you".into());
                     let now = Instant::now();
-                    let fetch = self.schedule_media_fetches(&text);
+                    let fetch = self.schedule_media_fetches(self.selected, &text);
+                    let ts = chatlog::iso_now();
+                    let net_log = self.current_network_name_for_log();
                     chatlog::append(
-                        &self.current_network_name_for_log(),
+                        &net_log,
                         &target,
-                        &format!("{}  <{}> {}", chatlog::iso_now(), nick, text),
+                        &format!("{}  <{}> {}", ts, nick, text),
                     );
+                    fts::append(&net_log, &target, &nick, &text, &ts);
                     self.channels[self.selected].messages.push(ChatMessage {
                         nick,
                         body: text,
@@ -1534,6 +1763,7 @@ impl App {
                         msgid: None,
                         reactions: HashMap::new(),
                         reply_to_msgid: reply_to,
+                        mask_nicks: Vec::new(),
                     });
                     self.now = now;
                     return fetch;
@@ -1668,7 +1898,15 @@ impl App {
                 Task::none()
             }
             Message::HoverChannel(v) => {
+                let changed = v != self.hovered_channel;
                 self.hovered_channel = v;
+                if changed {
+                    self.hovered_channel_at = if v.is_some() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                }
                 Task::none()
             }
             Message::HoverMember(v) => {
@@ -1784,6 +2022,7 @@ impl App {
                     client_cert_pass: None,
                     channels: Vec::new(),
                     buddies: Vec::new(),
+                    nick_notes: std::collections::BTreeMap::new(),
                     autoconnect: true,
                 });
                 self.settings_net_idx = self.settings_draft.networks.len() - 1;
@@ -2136,6 +2375,82 @@ impl App {
                 }
                 Task::none()
             }
+            Message::MemberContextNoteOpen => {
+                if let Some(ctx) = self.member_context.take() {
+                    let net_id = self.channels[ctx.channel_idx].network_id;
+                    let existing = self
+                        .net(net_id)
+                        .and_then(|n| {
+                            n.cfg.nick_notes.get(&ctx.nick.to_ascii_lowercase()).cloned()
+                        })
+                        .unwrap_or_default();
+                    self.nick_note_editor = Some(NickNoteEditor {
+                        network_id: net_id,
+                        nick: ctx.nick,
+                        draft: existing,
+                    });
+                    return iced::widget::operation::focus(NOTE_INPUT_ID);
+                }
+                Task::none()
+            }
+            Message::NoteEditorChanged(s) => {
+                if let Some(ed) = self.nick_note_editor.as_mut() {
+                    ed.draft = s;
+                }
+                Task::none()
+            }
+            Message::NoteEditorSave => {
+                if let Some(ed) = self.nick_note_editor.take() {
+                    let key = ed.nick.to_ascii_lowercase();
+                    let trimmed = ed.draft.trim().to_string();
+                    if let Some(net) = self.net_mut(ed.network_id) {
+                        if trimmed.is_empty() {
+                            net.cfg.nick_notes.remove(&key);
+                        } else {
+                            net.cfg.nick_notes.insert(key, trimmed);
+                        }
+                    }
+                    let _ = self.persist_config();
+                }
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::NoteEditorCancel => {
+                self.nick_note_editor = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::GlobalSearchQuery(q) => {
+                if let Some(gs) = self.global_search.as_mut() {
+                    gs.query = q;
+                    gs.hits = fts::search(&gs.query, 50);
+                }
+                Task::none()
+            }
+            Message::GlobalSearchClose => {
+                self.global_search = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::DigestDismiss => {
+                if let Some(ch) = self.channels.get_mut(self.selected) {
+                    ch.read_marker_idx = None;
+                    ch.has_unread = false;
+                    ch.has_mention = false;
+                }
+                Task::none()
+            }
+            Message::GlobalSearchSelect { network, channel } => {
+                self.global_search = None;
+                // Find the channel by network *name* (FTS stores name, not id)
+                let net_id = self
+                    .networks
+                    .iter()
+                    .find(|n| n.cfg.name == network)
+                    .map(|n| n.id);
+                if let Some(net_id) = net_id {
+                    let idx = self.ensure_channel_in(net_id, &channel);
+                    self.set_selected(idx);
+                }
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
         }
     }
 
@@ -2253,9 +2568,11 @@ impl App {
             return Task::none();
         }
 
-        // Cmd/Ctrl + F → toggle in-buffer search overlay.
+        // Cmd/Ctrl + F → toggle in-buffer search overlay. Requires
+        // `!shift` so ⌘⇧F routes to the global search instead.
         let is_cmd_f = matches!(&key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("f"))
-            && (modifiers.command() || modifiers.control());
+            && (modifiers.command() || modifiers.control())
+            && !modifiers.shift();
         if is_cmd_f {
             if self.search.is_some() {
                 self.search = None;
@@ -2263,6 +2580,29 @@ impl App {
             }
             self.search = Some(SearchState::default());
             return iced::widget::operation::focus(SEARCH_INPUT_ID);
+        }
+
+        // Cmd/Ctrl + Shift + P → toggle privacy mode (mask nicks for
+        // screenshots).
+        let is_cmd_shift_p = matches!(&key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("p"))
+            && (modifiers.command() || modifiers.control())
+            && modifiers.shift();
+        if is_cmd_shift_p {
+            self.privacy_mode = !self.privacy_mode;
+            return Task::none();
+        }
+
+        // Cmd/Ctrl + Shift + F → open global FTS search overlay.
+        let is_cmd_shift_f = matches!(&key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("f"))
+            && (modifiers.command() || modifiers.control())
+            && modifiers.shift();
+        if is_cmd_shift_f {
+            if self.global_search.is_some() {
+                self.global_search = None;
+                return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+            }
+            self.global_search = Some(GlobalSearchState::default());
+            return iced::widget::operation::focus(GSEARCH_INPUT_ID);
         }
 
         // Esc closes the search overlay when active.
@@ -2312,6 +2652,22 @@ impl App {
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         {
             self.reply_draft = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
+        // Esc closes the nick-note editor (cancels — discard the draft).
+        if self.nick_note_editor.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.nick_note_editor = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
+        // Esc closes the global FTS search overlay.
+        if self.global_search.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.global_search = None;
             return iced::widget::operation::focus(COMPOSE_INPUT_ID);
         }
 
@@ -2400,7 +2756,17 @@ impl App {
         }
     }
 
-    fn schedule_media_fetches(&mut self, body: &str) -> Task<Message> {
+    fn schedule_media_fetches(&mut self, channel_idx: usize, body: &str) -> Task<Message> {
+        // Per-channel opt-out via `/unfurl off` — keep URL spam from
+        // triggering page fetches in busy channels.
+        let unfurl_enabled = self
+            .channels
+            .get(channel_idx)
+            .map(|c| c.unfurl_enabled)
+            .unwrap_or(true);
+        if !unfurl_enabled {
+            return Task::none();
+        }
         let urls: Vec<String> = extract_urls(body)
             .into_iter()
             .filter(|u| !self.media_cache.contains_key(u))
@@ -2714,6 +3080,7 @@ impl App {
             "react" => self.cmd_react(rest, now),
             "setname" => self.cmd_setname(rest, now),
             "monitor" | "buddy" => self.cmd_monitor(rest, now),
+            "unfurl" => self.cmd_unfurl(rest, now),
             "msgid" => self.cmd_msgid(rest, now),
             "caps" => self.cmd_caps(now),
             other => {
@@ -2722,6 +3089,30 @@ impl App {
                     .push(system_line(&format!("unknown command: /{other}"), now));
             }
         }
+    }
+
+    fn cmd_unfurl(&mut self, rest: &str, now: Instant) {
+        let arg = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let ch = &mut self.channels[self.selected];
+        let new = match arg.as_str() {
+            "" | "toggle" => !ch.unfurl_enabled,
+            "on" | "1" | "true" | "yes" => true,
+            "off" | "0" | "false" | "no" => false,
+            _ => {
+                ch.messages.push(system_line(
+                    "usage: /unfurl on|off|toggle",
+                    now,
+                ));
+                return;
+            }
+        };
+        ch.unfurl_enabled = new;
+        let msg = if new {
+            "link unfurl on — URLs in this channel will fetch previews"
+        } else {
+            "link unfurl off — URLs in this channel render plain"
+        };
+        ch.messages.push(system_line(msg, now));
     }
 
     fn cmd_dimm(&mut self, rest: &str, now: Instant) {
@@ -3530,8 +3921,9 @@ impl App {
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Action,
             msgid: None,
-        reactions: HashMap::new(),
-        reply_to_msgid: None,
+            reactions: HashMap::new(),
+            reply_to_msgid: None,
+            mask_nicks: Vec::new(),
         });
     }
 
@@ -3565,8 +3957,9 @@ impl App {
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Chat,
             msgid: None,
-        reactions: HashMap::new(),
-        reply_to_msgid: None,
+            reactions: HashMap::new(),
+            reply_to_msgid: None,
+            mask_nicks: Vec::new(),
         });
         self.set_selected(idx);
     }
@@ -3981,14 +4374,16 @@ impl App {
                 let fetch = if is_backlog {
                     Task::none()
                 } else {
-                    self.schedule_media_fetches(&body)
+                    self.schedule_media_fetches(idx, &body)
                 };
                 if !is_backlog {
+                    let ts = chatlog::iso_now();
                     chatlog::append(
                         &net_name,
                         &bucket,
-                        &format!("{}  <{}> {}", chatlog::iso_now(), nick, body),
+                        &format!("{}  <{}> {}", ts, nick, body),
                     );
+                    fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
@@ -3997,6 +4392,9 @@ impl App {
                     &meta,
                     now,
                 ));
+                if !is_backlog {
+                    self.channels[idx].bump_activity(now);
+                }
                 fetch
             }
             IrcEvent::Action { target, nick, body, meta } => {
@@ -4040,14 +4438,16 @@ impl App {
                 let fetch = if is_backlog {
                     Task::none()
                 } else {
-                    self.schedule_media_fetches(&body)
+                    self.schedule_media_fetches(idx, &body)
                 };
                 if !is_backlog {
+                    let ts = chatlog::iso_now();
                     chatlog::append(
                         &net_name,
                         &bucket,
-                        &format!("{}  * {} {}", chatlog::iso_now(), nick, body),
+                        &format!("{}  * {} {}", ts, nick, body),
                     );
+                    fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
@@ -4056,6 +4456,9 @@ impl App {
                     &meta,
                     now,
                 ));
+                if !is_backlog {
+                    self.channels[idx].bump_activity(now);
+                }
                 fetch
             }
             IrcEvent::NickChanged { old, new, meta: _ } => {
@@ -4076,16 +4479,28 @@ impl App {
                         if let Some(meta) = ch.member_meta.remove(&old) {
                             ch.member_meta.insert(new.clone(), meta);
                         }
-                        let body = if is_self {
-                            format!("you are now {new}")
+                        let (body, nicks) = if is_self {
+                            (format!("you are now {new}"), vec![new.clone()])
                         } else {
-                            format!("{old} is now {new}")
+                            (
+                                format!("{old} is now {new}"),
+                                vec![old.clone(), new.clone()],
+                            )
                         };
-                        ch.messages.push(joinpart_line(&body, now));
+                        let mut m = joinpart_line(&body, now, None);
+                        m.mask_nicks = nicks;
+                        ch.messages.push(m);
                     }
                 }
                 if is_self {
-                    self.push_status_in(network_id, system_line(&format!("you are now {new}"), now));
+                    self.push_status_in(
+                        network_id,
+                        system_line_with_nicks(
+                            &format!("you are now {new}"),
+                            now,
+                            vec![new.clone()],
+                        ),
+                    );
                 }
                 Task::none()
             }
@@ -4124,7 +4539,7 @@ impl App {
                     };
                     self.channels[idx]
                         .messages
-                        .push(joinpart_line(&body, now));
+                        .push(joinpart_line(&body, now, Some(nick.clone())));
                 }
                 let my_nick = self
                     .net(network_id)
@@ -4212,6 +4627,7 @@ impl App {
                         };
                         entry.body = format!("[deleted by {by_nick}{suffix}]");
                         entry.kind = MsgKind::System;
+                        entry.mask_nicks.push(by_nick.clone());
                     }
                 }
                 Task::none()
@@ -4247,7 +4663,11 @@ impl App {
                     );
                     self.channels[idx]
                         .messages
-                        .push(joinpart_line(&format!("← {nick} left"), now));
+                        .push(joinpart_line(
+                            &format!("← {nick} left"),
+                            now,
+                            Some(nick.clone()),
+                        ));
                 }
                 Task::none()
             }
@@ -4591,12 +5011,12 @@ impl App {
                 continue;
             }
             if ch.members.iter().any(|n| n == nick) {
-                ch.messages.push(joinpart_line(body, now));
+                ch.messages.push(joinpart_line(body, now, Some(nick.to_string())));
                 hit_any = true;
             }
         }
         if !hit_any {
-            self.push_status_in(network_id, joinpart_line(body, now));
+            self.push_status_in(network_id, joinpart_line(body, now, Some(nick.to_string())));
         }
     }
 
@@ -4618,6 +5038,22 @@ impl App {
         let mut subs: Vec<Subscription<Message>> = Vec::new();
         if msg_anim || pane_anim || row_anim {
             subs.push(window::frames().map(Message::Tick));
+        }
+        // Low-frequency heartbeat so the activity sparkline rotates and decays
+        // even when no animation is running.
+        subs.push(
+            iced::time::every(std::time::Duration::from_secs(60))
+                .map(|_| Message::Tick(Instant::now())),
+        );
+        // While a channel is being hovered, tick fast enough that the
+        // sparkline tooltip arms once the dwell threshold passes.
+        if let Some(t) = self.hovered_channel_at {
+            if t.elapsed() < CHANNEL_HOVER_TOOLTIP_DELAY + std::time::Duration::from_millis(500) {
+                subs.push(
+                    iced::time::every(std::time::Duration::from_millis(250))
+                        .map(|_| Message::Tick(Instant::now())),
+                );
+            }
         }
         for net in &self.networks {
             if !net.autoconnect_enabled {
@@ -4698,9 +5134,227 @@ impl App {
             stack![main, self.palette_overlay()].into()
         } else if self.emoji_picker.is_some() {
             stack![main, self.emoji_picker_overlay()].into()
+        } else if self.nick_note_editor.is_some() {
+            stack![main, self.note_editor_overlay()].into()
+        } else if self.global_search.is_some() {
+            stack![main, self.global_search_overlay()].into()
         } else {
             main
         }
+    }
+
+    fn global_search_overlay(&self) -> Element<'_, Message> {
+        let gs = self
+            .global_search
+            .as_ref()
+            .expect("global_search_overlay called when closed");
+        let header = text("Search backlog")
+            .size(sz(13.0))
+            .font(medium())
+            .color(tok::text());
+        let input = text_input("type to search across all networks…", &gs.query)
+            .id(GSEARCH_INPUT_ID)
+            .on_input(Message::GlobalSearchQuery)
+            .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32));
+        let count = text(if gs.query.is_empty() {
+            "Esc closes · matches every network's local log".to_string()
+        } else {
+            format!("{} hits", gs.hits.len())
+        })
+        .size(sz(10.0))
+        .color(tok::text_faint());
+
+        let mut rows: Vec<Element<Message>> = Vec::new();
+        for h in gs.hits.iter().take(50) {
+            rows.push(self.global_search_row(h));
+        }
+        let list: Element<Message> = if rows.is_empty() {
+            container(
+                text(if gs.query.is_empty() {
+                    "(start typing to search)"
+                } else {
+                    "no matches"
+                })
+                .size(sz(11.0))
+                .color(tok::text_faint()),
+            )
+            .padding(pad(tok::S4 as f32, tok::S4 as f32, tok::S4 as f32, tok::S4 as f32))
+            .into()
+        } else {
+            scrollable(column(rows).spacing(0))
+                .height(Length::Fixed(420.0))
+                .into()
+        };
+
+        let panel = container(
+            column![header, input, count, list].spacing(tok::S2),
+        )
+        .padding(pad(tok::S4 as f32, tok::S4 as f32, tok::S4 as f32, tok::S4 as f32))
+        .width(Length::Fixed(620.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(tok::bg_elev())),
+            border: Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: Color { a: 0.5, ..tok::bg_2() },
+            },
+            shadow: Shadow {
+                color: Color { a: 0.4, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 8.0),
+                blur_radius: 24.0,
+            },
+            ..Default::default()
+        });
+        let backdrop: Element<Message> = mouse_area(
+            container(sp(Fill, Fill))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color { a: 0.45, ..Color::BLACK })),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::GlobalSearchClose)
+        .into();
+        let centered = container(panel)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center);
+        stack![backdrop, centered].into()
+    }
+
+    fn global_search_row<'a>(&'a self, h: &'a fts::Hit) -> Element<'a, Message> {
+        let nick_display = mask_nick(&h.nick, self.privacy_mode);
+        let nick_c = nick_color(&h.nick);
+        // Hide the literal nick from the snippet under privacy mode too.
+        let snippet = if self.privacy_mode {
+            h.snippet.replace(h.nick.as_str(), &privacy_mask(&h.nick))
+        } else {
+            h.snippet.clone()
+        };
+        let head = row![
+            text(format!("{} {}", h.channel, h.network))
+                .size(sz(11.0))
+                .color(tok::text_muted())
+                .font(regular()),
+            sp(Fill, 0),
+            text(h.ts.split('T').next().unwrap_or(&h.ts).to_string())
+                .size(sz(10.0))
+                .color(tok::text_faint())
+                .font(regular()),
+        ]
+        .spacing(tok::S2)
+        .align_y(iced::Alignment::Center);
+
+        let body = row![
+            text(nick_display).size(sz(12.0)).font(medium()).color(nick_c),
+            text(snippet)
+                .size(sz(12.0))
+                .color(tok::text())
+                .font(regular())
+                .wrapping(iced::widget::text::Wrapping::Word),
+        ]
+        .spacing(tok::S2);
+
+        let net = h.network.clone();
+        let chan = h.channel.clone();
+        let btn = button(column![head, body].spacing(2))
+            .on_press(Message::GlobalSearchSelect { network: net, channel: chan })
+            .width(Fill)
+            .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32))
+            .style(|_theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered => tok::bg_hover(),
+                    _ => Color::TRANSPARENT,
+                })),
+                text_color: tok::text(),
+                border: Border { radius: 4.0.into(), ..Default::default() },
+                shadow: Shadow::default(),
+                ..Default::default()
+            });
+        mouse_area(btn)
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
+    }
+
+    fn note_editor_overlay(&self) -> Element<'_, Message> {
+        let ed = self
+            .nick_note_editor
+            .as_ref()
+            .expect("note_editor_overlay called when editor closed");
+        let title_nick = mask_nick(&ed.nick, self.privacy_mode);
+        let header = text(format!("note · {title_nick}"))
+            .size(sz(13.0))
+            .font(medium())
+            .color(tok::text());
+        let input = text_input("private note (visible only to you)…", &ed.draft)
+            .id(NOTE_INPUT_ID)
+            .on_input(Message::NoteEditorChanged)
+            .on_submit(Message::NoteEditorSave)
+            .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32));
+        let save_btn = button(
+            text("Save").size(sz(12.0)).font(medium()).color(tok::text()),
+        )
+        .on_press(Message::NoteEditorSave)
+        .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S3 as f32))
+        .style(|_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered => tok::accent(),
+                _ => Color { a: 0.85, ..tok::accent() },
+            })),
+            text_color: tok::text(),
+            border: Border { radius: 4.0.into(), ..Default::default() },
+            shadow: Shadow::default(),
+            ..Default::default()
+        });
+        let cancel_btn = button(
+            text("Cancel").size(sz(12.0)).color(tok::text_mid()),
+        )
+        .on_press(Message::NoteEditorCancel)
+        .padding(pad(tok::S1 as f32, tok::S3 as f32, tok::S1 as f32, tok::S3 as f32))
+        .style(|_theme, status| ghost_button_style(status));
+        let hint = text("Enter saves · Esc cancels · empty deletes")
+            .size(sz(10.0))
+            .color(tok::text_faint());
+        let panel = container(
+            column![
+                header,
+                input,
+                row![sp(Fill, 0), cancel_btn, save_btn].spacing(tok::S2),
+                hint,
+            ]
+            .spacing(tok::S2),
+        )
+        .padding(pad(tok::S4 as f32, tok::S4 as f32, tok::S4 as f32, tok::S4 as f32))
+        .width(Length::Fixed(380.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(tok::bg_elev())),
+            border: Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: Color { a: 0.5, ..tok::bg_2() },
+            },
+            shadow: Shadow {
+                color: Color { a: 0.4, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 8.0),
+                blur_radius: 24.0,
+            },
+            ..Default::default()
+        });
+        let backdrop: Element<Message> = mouse_area(
+            container(sp(Fill, Fill))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color { a: 0.45, ..Color::BLACK })),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::NoteEditorCancel)
+        .into();
+        let centered = container(panel)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center);
+        stack![backdrop, centered].into()
     }
 
     fn palette_overlay(&self) -> Element<'_, Message> {
@@ -5820,11 +6474,12 @@ direct/raw file URL.",
             ..Default::default()
         });
 
+        let buddy_display = mask_nick(nick, self.privacy_mode);
         let row_content = row![
             container(dot)
                 .width(Length::Fixed(10.0))
                 .align_x(iced::alignment::Horizontal::Center),
-            text(truncate(nick, 18))
+            text(truncate(&buddy_display, 18).to_string())
                 .size(sz(13.0))
                 .font(label_font)
                 .wrapping(iced::widget::text::Wrapping::None)
@@ -5862,7 +6517,12 @@ direct/raw file URL.",
 
     fn channel_row(&self, i: usize, ch: &Channel) -> Element<'_, Message> {
         let selected = i == self.selected;
-        let (prefix, label) = channel_parts(&ch.name);
+        let (prefix, raw_label) = channel_parts(&ch.name);
+        let label = if prefix == "@" {
+            mask_nick(&raw_label, self.privacy_mode)
+        } else {
+            raw_label
+        };
 
         let now = self.now;
         let hover_v = ch.hover_anim.interpolate(0.0f32, 1.0f32, now);
@@ -5951,17 +6611,48 @@ direct/raw file URL.",
             btn.into()
         };
 
-        mouse_area(row_el)
+        let hover_el = mouse_area(row_el)
             .on_enter(Message::HoverChannel(Some(i)))
             .on_exit(Message::HoverChannel(None))
-            .interaction(iced::mouse::Interaction::Pointer)
+            .interaction(iced::mouse::Interaction::Pointer);
+
+        // Show the activity tooltip only after a dwell threshold — so a
+        // mouse passing through on its way to click another row doesn't
+        // flash the panel and collide visually.
+        let tooltip_armed = self.hovered_channel == Some(i)
+            && self
+                .hovered_channel_at
+                .is_some_and(|t| t.elapsed() >= CHANNEL_HOVER_TOOLTIP_DELAY);
+        if !tooltip_armed {
+            return hover_el.into();
+        }
+
+        let snapshot = ch.activity_snapshot(now);
+        let last_ago = ch
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.kind, MsgKind::Chat | MsgKind::Action))
+            .map(|m| now.saturating_duration_since(m.inserted_at).as_secs());
+        let popup = activity_popup(&snapshot, last_ago);
+        tooltip(hover_el, popup, tooltip::Position::Right)
+            .gap(tok::S2 as f32)
+            .style(|_| container::Style {
+                background: None,
+                ..Default::default()
+            })
             .into()
     }
 
     fn chat_pane(&self) -> Element<'_, Message> {
         let ch = &self.channels[self.selected];
 
-        let (prefix, label) = channel_parts(&ch.name);
+        let (prefix, raw_label) = channel_parts(&ch.name);
+        let label = if prefix == "@" {
+            mask_nick(&raw_label, self.privacy_mode)
+        } else {
+            raw_label
+        };
 
         let net_name = self
             .net(ch.network_id)
@@ -6016,11 +6707,35 @@ direct/raw file URL.",
             Message::ToggleMembers,
         );
 
+        let privacy_pill: Element<Message> = if self.privacy_mode {
+            container(
+                text("PRIVACY")
+                    .size(sz(10.0))
+                    .font(medium())
+                    .color(tok::accent()),
+            )
+            .padding(pad(2.0, 8.0, 2.0, 8.0))
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color { a: 0.12, ..tok::accent() })),
+                border: Border {
+                    color: Color { a: 0.45, ..tok::accent() },
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            sp(0, 0).into()
+        };
+
         let header = container(
             row![
                 left_toggle,
-                column![header_title, header_topic].spacing(tok::S1),
-                sp(Fill, 0),
+                column![header_title, header_topic]
+                    .spacing(tok::S1)
+                    .width(Length::Fill),
+                privacy_pill,
                 right_toggle,
             ]
             .spacing(tok::S3)
@@ -6178,7 +6893,7 @@ direct/raw file URL.",
             .size(sz(12.0))
             .color(accent)
             .font(medium());
-        let to_label = text(format!("to {}", d.parent_nick))
+        let to_label = text(format!("to {}", mask_nick(&d.parent_nick, self.privacy_mode)))
             .size(sz(11.0))
             .color(tok::text_mid())
             .font(medium());
@@ -6233,6 +6948,15 @@ direct/raw file URL.",
         let baseline = ch.fade_baseline;
 
         let mut out: Vec<Element<Message>> = Vec::with_capacity(ch.messages.len() * 2);
+        // Smart unread digest: at-a-glance summary of what landed while we
+        // were away. Only shown when the channel was actually backgrounded
+        // (read_marker_idx set) and there's enough activity to warrant a
+        // pre-scroll glance.
+        if let Some(idx) = ch.read_marker_idx {
+            if let Some(banner) = self.unread_digest_banner(ch, idx, my_nick) {
+                out.push(banner);
+            }
+        }
         let mut prev_day: Option<&str> = None;
         let mut prev_nick: Option<&str> = None;
         let mut prev_secs: u64 = 0;
@@ -6308,6 +7032,7 @@ direct/raw file URL.",
                 search_q_ref,
                 parent_quote,
                 adjacent_reply,
+                &ch.members,
             );
             let line_el: Element<Message> = if let Some(msgid) = m.msgid.clone() {
                 let channel_idx = self.selected;
@@ -6431,6 +7156,119 @@ direct/raw file URL.",
             .into()
     }
 
+    /// Build a smart pre-scroll digest banner summarizing what landed
+    /// since the read marker. Returns `None` when below the noise floor
+    /// (under 5 unread messages) or marker is past the buffer end.
+    fn unread_digest_banner<'a>(
+        &'a self,
+        ch: &'a Channel,
+        marker_idx: usize,
+        my_nick: &str,
+    ) -> Option<Element<'a, Message>> {
+        if marker_idx >= ch.messages.len() {
+            return None;
+        }
+        let unread = &ch.messages[marker_idx..];
+        let new_count = unread
+            .iter()
+            .filter(|m| matches!(m.kind, MsgKind::Chat | MsgKind::Action))
+            .count();
+        if new_count < 5 {
+            return None;
+        }
+        let mention_count = unread
+            .iter()
+            .filter(|m| {
+                matches!(m.kind, MsgKind::Chat | MsgKind::Action)
+                    && mentions(&m.body, my_nick)
+            })
+            .count();
+
+        // Top contributors among the unread.
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for m in unread.iter() {
+            if matches!(m.kind, MsgKind::Chat | MsgKind::Action)
+                && !m.nick.is_empty()
+                && m.nick != my_nick
+            {
+                *counts.entry(m.nick.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut top: Vec<(&str, u32)> = counts.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let top_str = top
+            .iter()
+            .take(3)
+            .map(|(nick, n)| format!("{} ({})", mask_nick(nick, self.privacy_mode), n))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut parts: Vec<String> = vec![format!(
+            "{} new message{}",
+            new_count,
+            if new_count == 1 { "" } else { "s" }
+        )];
+        if mention_count > 0 {
+            parts.push(format!(
+                "{} mention{}",
+                mention_count,
+                if mention_count == 1 { "" } else { "s" }
+            ));
+        }
+        if !top_str.is_empty() {
+            parts.push(format!("top: {top_str}"));
+        }
+        let summary = parts.join(" · ");
+
+        let accent = tok::accent();
+        let bg = Color { a: 0.10, ..accent };
+        let border = Color { a: 0.45, ..accent };
+        let row = row![
+            text("↓").size(sz(12.0)).color(accent).font(medium()),
+            text(summary)
+                .size(sz(11.0))
+                .color(tok::text())
+                .font(regular())
+                .wrapping(iced::widget::text::Wrapping::None),
+            sp(Fill, 0),
+            text("× dismiss")
+                .size(sz(10.0))
+                .color(tok::text_muted())
+                .font(regular()),
+        ]
+        .spacing(tok::S2)
+        .align_y(iced::Alignment::Center);
+        let btn = button(row)
+            .on_press(Message::DigestDismiss)
+            .width(Fill)
+            .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32))
+            .style(move |_theme, status| {
+                let hover = matches!(status, button::Status::Hovered);
+                let bg = if hover {
+                    Color { a: 0.16, ..accent }
+                } else {
+                    bg
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: tok::text(),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: border,
+                    },
+                    shadow: Shadow::default(),
+                    ..Default::default()
+                }
+            });
+        Some(
+            container(mouse_area(btn).interaction(iced::mouse::Interaction::Pointer))
+                .padding(pad(0.0, 0.0, tok::S2 as f32, 0.0))
+                .width(Fill)
+                .into(),
+        )
+    }
+
     fn read_marker_row<'a>(&'a self) -> Element<'a, Message> {
         let accent = tok::accent();
         let faint_accent = Color { a: 0.45, ..accent };
@@ -6485,6 +7323,7 @@ direct/raw file URL.",
         search_q: Option<&str>,
         parent_quote: Option<(String, String)>,
         adjacent_reply: bool,
+        channel_members: &[String],
     ) -> Element<'a, Message> {
         let start = m.inserted_at.max(baseline);
         let age_ms = start.elapsed().as_millis().min(FADE_MS);
@@ -6503,7 +7342,8 @@ direct/raw file URL.",
         // alignment but skip the nick span, so their body starts at the
         // same X as the nick of the head message in the group.
         let time_color = Color { a: 0.7 * alpha, ..tok::text_faint() };
-        let nick_short = truncate(&m.nick, 12).to_string();
+        let nick_display = mask_nick(&m.nick, self.privacy_mode);
+        let nick_short = truncate(&nick_display, 12).to_string();
 
         let (body_font, body_color) = if m.kind == MsgKind::Action {
             (italic(), tok::text_mid())
@@ -6551,8 +7391,40 @@ direct/raw file URL.",
             spans.push(nick_span);
         }
 
+        // Privacy mode: replace nicks baked into the body (system/joinpart
+        // and "nick: ..." style addressing in Chat/Action) with their mask.
+        let body_owned: String;
+        let body_ref: &str = if self.privacy_mode {
+            // Mask priority: baked-in nicks from the message + every member
+            // of this channel that literally appears in the body. Longest
+            // first so substrings of longer nicks aren't partially rewritten.
+            let mut nicks: Vec<String> = m.mask_nicks.clone();
+            for member in channel_members {
+                if !nicks.iter().any(|n| n == member)
+                    && m.body.contains(member.as_str())
+                {
+                    nicks.push(member.clone());
+                }
+            }
+            if nicks.is_empty() {
+                m.body.as_str()
+            } else {
+                nicks.sort_by_key(|n| std::cmp::Reverse(n.len()));
+                let mut s = m.body.clone();
+                for n in &nicks {
+                    if !n.is_empty() {
+                        s = s.replace(n.as_str(), &privacy_mask(n));
+                    }
+                }
+                body_owned = s;
+                body_owned.as_str()
+            }
+        } else {
+            m.body.as_str()
+        };
+
         let hl_bg = Color { a: 0.55 * alpha, ..tok::accent() };
-        for seg in body_segments(&m.body) {
+        for seg in body_segments(body_ref) {
             match seg {
                 BodySeg::Text(t) => {
                     let parts = match search_q {
@@ -6621,11 +7493,12 @@ direct/raw file URL.",
 
         let quote_el: Option<Element<Message>> = parent_quote.map(|(pn, pb)| {
             let pn_color = nick_color(&pn);
+            let pn_display = mask_nick(&pn, self.privacy_mode);
             let arrow = text("↳")
                 .size(sz(11.0))
                 .color(Color { a: alpha, ..tok::accent() })
                 .font(medium());
-            let nick_lbl = text(pn)
+            let nick_lbl = text(pn_display)
                 .size(sz(11.0))
                 .color(Color { a: alpha, ..pn_color })
                 .font(medium());
@@ -6732,9 +7605,29 @@ direct/raw file URL.",
         }
 
         // Render the highest-priority prefix as a leading glyph.
+        let display = mask_nick(nick, self.privacy_mode);
         let label = match prefix {
-            Some(p) => format!("{p}{}", truncate(nick, 14)),
-            None => truncate(nick, 14).to_string(),
+            Some(p) => format!("{p}{}", truncate(&display, 14)),
+            None => truncate(&display, 14).to_string(),
+        };
+
+        // Note lookup (per active network).
+        let note = self
+            .active
+            .and_then(|net_id| self.net(net_id))
+            .and_then(|n| n.cfg.nick_notes.get(&nick.to_ascii_lowercase()).cloned());
+
+        // Tiny accent square between the dot and the label when a note exists.
+        let note_indicator: Element<Message> = if note.is_some() {
+            container(sp(4, 4))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(tok::accent())),
+                    border: Border { radius: 2.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            sp(0, 0).into()
         };
 
         let row_content = row![
@@ -6749,6 +7642,8 @@ direct/raw file URL.",
                 .color(text_color)
                 .font(if hovered { medium() } else { regular() })
                 .wrapping(iced::widget::text::Wrapping::None),
+            sp(Fill, Length::Shrink),
+            note_indicator,
         ]
         .spacing(tok::S2)
         .align_y(iced::Alignment::Center);
@@ -6759,12 +7654,41 @@ direct/raw file URL.",
             .padding(pad(1.0, tok::S4 as f32, 1.0, tok::S4 as f32))
             .style(move |_theme, status| member_row_style(status));
 
-        mouse_area(btn)
+        let hover_el = mouse_area(btn)
             .on_enter(Message::HoverMember(Some(i)))
             .on_exit(Message::HoverMember(None))
             .on_right_press(Message::MemberContextOpen { nick: nick.to_string() })
-            .interaction(iced::mouse::Interaction::Pointer)
-            .into()
+            .interaction(iced::mouse::Interaction::Pointer);
+
+        match note {
+            Some(n) => {
+                let popup = container(
+                    text(n)
+                        .size(sz(11.0))
+                        .font(regular())
+                        .color(tok::text()),
+                )
+                .padding(pad(tok::S2 as f32, tok::S3 as f32, tok::S2 as f32, tok::S3 as f32))
+                .max_width(260.0)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(tok::bg_elev())),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: Color { a: 0.5, ..tok::accent() },
+                    },
+                    ..Default::default()
+                });
+                tooltip(hover_el, popup, tooltip::Position::Left)
+                    .gap(tok::S2 as f32)
+                    .style(|_| container::Style {
+                        background: None,
+                        ..Default::default()
+                    })
+                    .into()
+            }
+            None => hover_el.into(),
+        }
     }
 
     fn member_action_bar(&self, nick: &str) -> Element<'_, Message> {
@@ -6785,6 +7709,15 @@ direct/raw file URL.",
 
         items.push(member_action_button("Message".into(), Message::MemberContextDm));
         items.push(member_action_button("Whois".into(), Message::MemberContextWhois));
+        let net_id_for_note = self.channels[self.selected].network_id;
+        let has_note = self
+            .net(net_id_for_note)
+            .map(|n| n.cfg.nick_notes.contains_key(&nick.to_ascii_lowercase()))
+            .unwrap_or(false);
+        items.push(member_action_button(
+            if has_note { "Edit note…".into() } else { "Add note…".into() },
+            Message::MemberContextNoteOpen,
+        ));
         let net_id = self.channels[self.selected].network_id;
         let is_buddy = self
             .net(net_id)
