@@ -360,6 +360,13 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                 nick_password: if use_sasl { None } else { cfg.nick_password.clone() },
                 client_cert_path: cfg.client_cert_path.clone(),
                 client_cert_pass: cfg.client_cert_pass.clone(),
+                // CTCP auto-replies sent by the irc crate. Identify as
+                // murmur instead of the crate's default "irc:VERSION:env".
+                version: Some(format!(
+                    "murmur {} (iced) — https://murmur.priet.us",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                source: Some("https://murmur.priet.us".into()),
                 ..Config::default()
             };
 

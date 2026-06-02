@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod badge;
 mod config;
 mod emoji;
 mod fts;
@@ -690,6 +691,10 @@ struct App {
     nick_note_editor: Option<NickNoteEditor>,
     /// Global FTS5 backlog-search overlay (⌘⇧F). `None` when closed.
     global_search: Option<GlobalSearchState>,
+    /// Last total of unread highlight/DM messages pushed to the OS dock
+    /// badge. Cached so we only do the FFI hop when the number actually
+    /// changes.
+    last_badge_total: u32,
 }
 
 #[derive(Default)]
@@ -775,6 +780,10 @@ struct Channel {
     fade_baseline: Instant,
     has_unread: bool,
     has_mention: bool,
+    /// Number of unread highlight/DM messages since last read. Drives
+    /// the OS dock badge total. Increments alongside `has_mention =
+    /// true`; resets to 0 when the channel is marked read.
+    highlight_count: u32,
     /// Whether we've already asked the server for initial backlog
     /// (CHATHISTORY LATEST). Set on first self-join to avoid refetching.
     chathistory_requested: bool,
@@ -1017,6 +1026,7 @@ impl Default for App {
             privacy_mode: false,
             nick_note_editor: None,
             global_search: None,
+            last_badge_total: 0,
         };
 
         match config::load() {
@@ -1169,6 +1179,7 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         fade_baseline: Instant::now(),
         has_unread: false,
         has_mention: false,
+        highlight_count: 0,
         chathistory_requested: false,
         read_marker_idx: None,
         activity: new_activity_buf(),
@@ -1661,6 +1672,7 @@ impl App {
             fade_baseline: Instant::now(),
             has_unread: false,
             has_mention: false,
+            highlight_count: 0,
             chathistory_requested: false,
             read_marker_idx: None,
             activity: new_activity_buf(),
@@ -1678,8 +1690,21 @@ impl App {
             let now = Instant::now();
             self.now = now;
             self.sync_channel_animations(now);
+            self.refresh_badge();
         }
         task
+    }
+
+    fn refresh_badge(&mut self) {
+        let total: u32 = self
+            .channels
+            .iter()
+            .map(|c| c.highlight_count)
+            .sum();
+        if total != self.last_badge_total {
+            self.last_badge_total = total;
+            badge::set(total);
+        }
     }
 
     fn dispatch(&mut self, message: Message) -> Task<Message> {
@@ -2450,6 +2475,7 @@ impl App {
                     ch.read_marker_idx = None;
                     ch.has_unread = false;
                     ch.has_mention = false;
+                    ch.highlight_count = 0;
                 }
                 Task::none()
             }
@@ -4417,6 +4443,8 @@ impl App {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
+                        self.channels[idx].highlight_count =
+                            self.channels[idx].highlight_count.saturating_add(1);
                     }
                     if self.channels[idx].read_marker_idx.is_none() {
                         self.channels[idx].read_marker_idx =
@@ -4481,6 +4509,8 @@ impl App {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
+                        self.channels[idx].highlight_count =
+                            self.channels[idx].highlight_count.saturating_add(1);
                     }
                     if self.channels[idx].read_marker_idx.is_none() {
                         self.channels[idx].read_marker_idx =
@@ -4872,6 +4902,7 @@ impl App {
         if self.window_focused {
             self.channels[i].has_unread = false;
             self.channels[i].has_mention = false;
+            self.channels[i].highlight_count = 0;
             self.send_read_marker();
         }
     }
@@ -4910,6 +4941,7 @@ impl App {
         {
             self.channels[self.selected].has_unread = false;
             self.channels[self.selected].has_mention = false;
+            self.channels[self.selected].highlight_count = 0;
         }
     }
 
