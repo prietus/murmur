@@ -7508,24 +7508,45 @@ direct/raw file URL.",
         };
 
         let hl_bg = Color { a: 0.55 * alpha, ..tok::accent() };
+        // Highlight nicks baked into the body — `nick:` addressing, mid-
+        // sentence mentions — in their nick palette colour so you can spot
+        // who's being talked to at a glance. Skipped in privacy mode (the
+        // body already had nicks rewritten to masks) and on system lines
+        // (their nick chrome is handled by `mask_nicks` upstream).
+        let highlight_nicks =
+            !self.privacy_mode && m.kind != MsgKind::System && !channel_members.is_empty();
         for seg in body_segments(body_ref) {
             match seg {
                 BodySeg::Text(t) => {
-                    let parts = match search_q {
-                        Some(q) => split_on_query(t, q),
-                        None => vec![(t, false)],
+                    let nick_parts = if highlight_nicks {
+                        split_text_for_nicks(t, channel_members)
+                    } else {
+                        vec![(t, None)]
                     };
-                    for (chunk, is_match) in parts {
-                        if chunk.is_empty() {
-                            continue;
+                    for (sub, nick_match) in nick_parts {
+                        let (chunk_color, chunk_font) = match nick_match {
+                            Some(nick) => {
+                                let nc = nick_color(nick);
+                                (Color { a: alpha, ..nc }, medium())
+                            }
+                            None => (text_color, body_font),
+                        };
+                        let parts = match search_q {
+                            Some(q) => split_on_query(sub, q),
+                            None => vec![(sub, false)],
+                        };
+                        for (chunk, is_match) in parts {
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            let mut sp = iced::widget::span(chunk.to_string())
+                                .color(chunk_color)
+                                .font(chunk_font);
+                            if is_match {
+                                sp = sp.background(hl_bg);
+                            }
+                            spans.push(sp);
                         }
-                        let mut sp = iced::widget::span(chunk.to_string())
-                            .color(text_color)
-                            .font(body_font);
-                        if is_match {
-                            sp = sp.background(hl_bg);
-                        }
-                        spans.push(sp);
                     }
                 }
                 BodySeg::Url(u) => {
@@ -7961,6 +7982,76 @@ fn split_on_query<'a>(s: &'a str, q_lower: &str) -> Vec<(&'a str, bool)> {
                 break;
             }
         }
+    }
+    out
+}
+
+/// Splits a text run into chunks marked with the channel member nick they
+/// resolve to, when any. Matches are bounded by non-nick chars on both
+/// sides so `terryflapsXY` doesn't match `terryflaps`, and longest-first
+/// so `terraflopsbot` wins over `terraflops`. Empty members or empty
+/// input short-circuit to a single unmarked chunk.
+fn split_text_for_nicks<'a>(
+    text: &'a str,
+    members: &'a [String],
+) -> Vec<(&'a str, Option<&'a str>)> {
+    if text.is_empty() || members.is_empty() {
+        return vec![(text, None)];
+    }
+    let is_nick_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '[' | ']' | '\\' | '`' | '{' | '}' | '|' | '^')
+    };
+    let mut sorted: Vec<&str> = members
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
+
+    let mut spans: Vec<(usize, usize, &str)> = Vec::new();
+    let mut occupied: Vec<bool> = vec![false; text.len()];
+    for nick in &sorted {
+        let mut search_from = 0;
+        while search_from < text.len() {
+            let Some(rel) = text[search_from..].find(nick) else { break };
+            let start = search_from + rel;
+            let end = start + nick.len();
+            let overlap = occupied[start..end].iter().any(|b| *b);
+            let prev_ok = text[..start]
+                .chars()
+                .next_back()
+                .map(|c| !is_nick_char(c))
+                .unwrap_or(true);
+            let next_ok = text[end..]
+                .chars()
+                .next()
+                .map(|c| !is_nick_char(c))
+                .unwrap_or(true);
+            if !overlap && prev_ok && next_ok {
+                spans.push((start, end, *nick));
+                for b in &mut occupied[start..end] {
+                    *b = true;
+                }
+            }
+            search_from = start + nick.len().max(1);
+        }
+    }
+    if spans.is_empty() {
+        return vec![(text, None)];
+    }
+    spans.sort_by_key(|s| s.0);
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    for (start, end, nick) in spans {
+        if start > cursor {
+            out.push((&text[cursor..start], None));
+        }
+        out.push((&text[start..end], Some(nick)));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        out.push((&text[cursor..], None));
     }
     out
 }

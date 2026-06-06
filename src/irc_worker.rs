@@ -874,6 +874,30 @@ fn handle_auth_msg(
                 // Nothing to request — close negotiation and identify.
                 return AuthOutcome::NeedIdentify;
             }
+            // Send NICK + USER before AUTHENTICATE. The IRCv3 SASL spec
+            // allows registration commands at any point during cap
+            // negotiation, but some servers (notably soju) refuse the
+            // SASL exchange until NICK is on file ("Expected NICK
+            // command before AUTHENTICATE"). Send pre-emptively when we
+            // intend to do SASL.
+            if use_sasl {
+                if let Err(e) = sender.send(Command::NICK(cfg.nickname.clone())) {
+                    return AuthOutcome::Failed(format!("send NICK: {e}"));
+                }
+                let username = cfg
+                    .username
+                    .clone()
+                    .unwrap_or_else(|| cfg.nickname.clone());
+                let realname = cfg
+                    .realname
+                    .clone()
+                    .unwrap_or_else(|| cfg.nickname.clone());
+                if let Err(e) =
+                    sender.send(Command::USER(username, "0".into(), realname))
+                {
+                    return AuthOutcome::Failed(format!("send USER: {e}"));
+                }
+            }
             let req_str = wanted.join(" ");
             if let Err(e) = sender.send(Command::CAP(
                 None,
@@ -990,16 +1014,11 @@ fn handle_auth_msg(
         }
         Command::Response(code, args) => match *code {
             Response::RPL_SASLSUCCESS if *phase == AuthPhase::AwaitingResult => {
+                // NICK + USER were already sent before the CAP REQ to
+                // satisfy strict servers like soju. Just close cap
+                // negotiation here.
                 if let Err(e) = sender.send(Command::CAP(None, CapSubCommand::END, None, None)) {
                     return AuthOutcome::Failed(format!("send CAP END: {e}"));
-                }
-                if let Err(e) = sender.send(Command::NICK(cfg.nickname.clone())) {
-                    return AuthOutcome::Failed(format!("send NICK: {e}"));
-                }
-                let username = cfg.username.clone().unwrap_or_else(|| cfg.nickname.clone());
-                let realname = cfg.realname.clone().unwrap_or_else(|| cfg.nickname.clone());
-                if let Err(e) = sender.send(Command::USER(username, "0".into(), realname)) {
-                    return AuthOutcome::Failed(format!("send USER: {e}"));
                 }
                 *phase = AuthPhase::Done;
                 AuthOutcome::Done
