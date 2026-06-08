@@ -1,7 +1,7 @@
-# Maintainer: Carlos Prieto <cprieto.ortiz@gmail.com>
+# Maintainer: Carlos Prieto <prietus@live.com>
 pkgname=murmur-bin
 _pkgname=murmur
-pkgver=0.2.0
+pkgver=0.3.8
 pkgrel=1
 pkgdesc='A native, opinionated IRC client. Subtle by default. IRCv3-ready. (prebuilt binary)'
 arch=('x86_64')
@@ -17,6 +17,10 @@ depends=(
   'wayland'
   'gcc-libs'
   'glibc'
+)
+optdepends=(
+  'hunspell-en_us: English autocomplete (ghost text)'
+  'hunspell-es_es: Spanish autocomplete (ghost text)'
 )
 source_x86_64=(
   "$_pkgname-$pkgver-x86_64.tar.gz::https://github.com/prietus/murmur/releases/download/v$pkgver/murmur-x86_64-unknown-linux-gnu.tar.gz"

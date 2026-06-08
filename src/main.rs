@@ -2,6 +2,7 @@
 
 mod badge;
 mod config;
+mod dict;
 mod emoji;
 mod fts;
 mod irc_worker;
@@ -695,6 +696,13 @@ struct App {
     /// badge. Cached so we only do the FFI hop when the number actually
     /// changes.
     last_badge_total: u32,
+    /// Lowercased dictionary words (hunspell `.dic` files) loaded from
+    /// `<config_dir>/dicts/` at startup. Drives the ghost-text fallback
+    /// when no nick / command / buffer word matches the typed prefix.
+    dict_words: std::collections::BTreeSet<String>,
+    /// Lowercased words seen in recent channel messages → frequency.
+    /// Drives the ghost-text fallback for jargon, proper nouns, etc.
+    buffer_words: HashMap<String, u32>,
 }
 
 #[derive(Default)]
@@ -1027,6 +1035,8 @@ impl Default for App {
             nick_note_editor: None,
             global_search: None,
             last_badge_total: 0,
+            dict_words: load_dict_words(),
+            buffer_words: HashMap::new(),
         };
 
         match config::load() {
@@ -2981,6 +2991,96 @@ impl App {
         true
     }
 
+    fn record_buffer_words(&mut self, body: &str) {
+        for w in tokenize_words(body) {
+            if w.len() < 4 || w.len() > 32 {
+                continue;
+            }
+            *self.buffer_words.entry(w).or_insert(0) += 1;
+        }
+        if self.buffer_words.len() > 4096 {
+            let mut entries: Vec<(String, u32)> = self.buffer_words.drain().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.truncate(2048);
+            self.buffer_words = entries.into_iter().collect();
+        }
+    }
+
+    fn buffer_word_completion(&self, prefix: &str) -> Option<String> {
+        if prefix.len() < 2 {
+            return None;
+        }
+        let lower = prefix.to_lowercase();
+        let mut best: Option<(&String, u32)> = None;
+        for (w, freq) in &self.buffer_words {
+            if !w.starts_with(&lower) || w.len() <= lower.len() {
+                continue;
+            }
+            match best {
+                Some((_, bf)) if bf >= *freq => {}
+                _ => best = Some((w, *freq)),
+            }
+        }
+        best.map(|(w, _)| w[lower.len()..].to_string())
+    }
+
+    fn ghost_suggestion(&self) -> Option<String> {
+        let s = &self.input;
+        if s.is_empty() {
+            return None;
+        }
+        if s.chars().last().map_or(true, |c| c.is_whitespace()) {
+            return None;
+        }
+        let start = last_word_start(s);
+        let raw = &s[start..];
+
+        if raw.starts_with('/') && start == 0 {
+            let p = raw.trim_start_matches('/').to_lowercase();
+            if p.is_empty() {
+                return None;
+            }
+            for (name, _, _) in PALETTE_COMMANDS {
+                let n = name.trim_start_matches('/').to_lowercase();
+                if n.starts_with(&p) && n.len() > p.len() {
+                    return Some(n[p.len()..].to_string());
+                }
+            }
+            return None;
+        }
+
+        let stripped_offset = if raw.starts_with('@') { 1 } else { 0 };
+        let stripped = &raw[stripped_offset..];
+        if stripped.is_empty() {
+            return None;
+        }
+        let p = stripped.to_lowercase();
+        if let Some(ch) = self.channels.get(self.selected) {
+            if let Some(m) = ch.members.iter().find(|n| {
+                let nl = n.to_lowercase();
+                nl.starts_with(&p) && nl.len() > p.len()
+            }) {
+                return Some(m[stripped.len()..].to_string());
+            }
+        }
+        // Word-level fallback only for plain prefixes (no @-prefix, real
+        // letters, ≥ 2 chars). Buffer beats dict because it reflects what
+        // the user is actually seeing right now.
+        if stripped_offset != 0 || stripped.len() < 2 {
+            return None;
+        }
+        if !stripped.chars().all(|c| c.is_alphabetic()) {
+            return None;
+        }
+        if let Some(rest) = self.buffer_word_completion(stripped) {
+            return Some(rest);
+        }
+        if let Some(w) = dict::find_completion(&self.dict_words, stripped) {
+            return Some(w[p.len()..].to_string());
+        }
+        None
+    }
+
     fn try_tab_complete(&mut self) -> bool {
         if let Some(ts) = &mut self.tab_state {
             if self.input == ts.expected_input && !ts.matches.is_empty() {
@@ -3029,6 +3129,16 @@ impl App {
         };
 
         if matches.is_empty() {
+            // No nick / command match — fall back to the ghost suggestion
+            // (buffer-words / dictionary). Just append the rest, no cycling
+            // through alternatives and no trailing suffix.
+            if let Some(rest) = self.ghost_suggestion() {
+                if !rest.is_empty() {
+                    self.input.push_str(&rest);
+                    self.tab_state = None;
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -4465,6 +4575,7 @@ impl App {
                     );
                     fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
+                self.record_buffer_words(&body);
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
@@ -4531,6 +4642,7 @@ impl App {
                     );
                     fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
+                self.record_buffer_words(&body);
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
@@ -6858,13 +6970,40 @@ direct/raw file URL.",
         let placeholder = compose_placeholder(&ch.name);
         let has_text = !self.input.trim().is_empty();
 
-        let text_field = text_input(&placeholder, &self.input)
+        let ghost_str = self.ghost_suggestion().unwrap_or_default();
+        let typed = self.input.clone();
+
+        let text_field_raw = text_input(&placeholder, &self.input)
             .id(COMPOSE_INPUT_ID)
             .on_input(Message::InputChanged)
             .on_submit(Message::SendMessage)
             .size(sz(13.0))
             .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
-            .style(|_theme, status| input_style(status));
+            .style(|_theme, status| input_style_transparent_bg(status));
+
+        let underlay = container(
+            iced::widget::rich_text(vec![
+                iced::widget::span(typed).color(Color::TRANSPARENT),
+                iced::widget::span(ghost_str).color(tok::text_faint()),
+            ])
+            .size(sz(13.0))
+            .font(regular())
+            .on_link_click(Message::OpenUrl),
+        )
+        .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
+        .width(Fill);
+
+        let text_field: Element<Message> = container(stack![underlay, text_field_raw])
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_2())),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+            .into();
 
         let send_btn = button(
             container(text("↑").size(sz(16.0)).font(medium()).color(if has_text {
@@ -7889,6 +8028,14 @@ fn toggle_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
         ..Default::default()
     })
     .into()
+}
+
+fn input_style_transparent_bg(
+    status: iced::widget::text_input::Status,
+) -> iced::widget::text_input::Style {
+    let mut s = input_style(status);
+    s.background = Background::Color(Color::TRANSPARENT);
+    s
 }
 
 fn input_style(status: iced::widget::text_input::Status) -> iced::widget::text_input::Style {
@@ -8986,6 +9133,32 @@ fn media_error<'a>(url: &str, msg: &str, alpha: f32) -> Element<'a, Message> {
     )
     .padding(pad(2.0, 0.0, 2.0, 0.0))
     .into()
+}
+
+fn load_dict_words() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(dir) = directories::ProjectDirs::from("", "", "murmur") {
+        let user = dir.config_dir().join("dicts");
+        out.extend(dict::load_dir(&user));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for sys in ["/usr/share/hunspell", "/usr/share/myspell/dicts"] {
+            out.extend(dict::load_dir(std::path::Path::new(sys)));
+        }
+    }
+    out
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphabetic() || c == '\''
+}
+
+fn tokenize_words(body: &str) -> impl Iterator<Item = String> + '_ {
+    body.split(|c: char| !is_word_char(c))
+        .filter(|w| w.chars().count() >= 4)
+        .filter(|w| !w.chars().all(|c| c.is_ascii()) || w.chars().any(|c| c.is_alphabetic()))
+        .map(|w| w.to_lowercase())
 }
 
 fn last_word_start(s: &str) -> usize {
