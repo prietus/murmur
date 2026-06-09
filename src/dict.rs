@@ -1,29 +1,38 @@
 //! Hunspell `.dic` reader for autocomplete.
 //!
 //! Reads every `*.dic` file in a directory, parses the words (stripping
-//! `/affix-flags` and comments), and returns them as a sorted set we can
-//! use for prefix lookup.
+//! `/affix-flags` and comments), and groups them by ISO-639-1 language
+//! code derived from the filename. `en_US.dic` and `en_GB.dic` both
+//! merge into the `"en"` bucket.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
-pub fn load_dir(dir: &Path) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+/// Load every `*.dic` in `dir` and merge into the given lang → words
+/// map. Lang code = lowercase first 2 letters of the filename stem.
+pub fn load_dir_into(dir: &Path, out: &mut HashMap<String, BTreeSet<String>>) {
     let Ok(entries) = fs::read_dir(dir) else {
-        return out;
+        return;
     };
     for ent in entries.flatten() {
         let path = ent.path();
         if path.extension().and_then(|s| s.to_str()) != Some("dic") {
             continue;
         }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let lang: String = stem.chars().take(2).collect::<String>().to_ascii_lowercase();
+        if lang.chars().count() < 2 {
+            continue;
+        }
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        parse_into(&text, &mut out);
+        let bucket = out.entry(lang).or_default();
+        parse_into(&text, bucket);
     }
-    out
 }
 
 fn parse_into(text: &str, out: &mut BTreeSet<String>) {
@@ -45,8 +54,6 @@ fn parse_into(text: &str, out: &mut BTreeSet<String>) {
         if word.is_empty() || word.len() < 3 {
             continue;
         }
-        // Skip entries that look like abbreviations or proper-noun
-        // markers (all upper, contain digits, contain punctuation).
         if word.chars().any(|c| c.is_ascii_digit()) {
             continue;
         }

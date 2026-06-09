@@ -112,6 +112,10 @@ pub struct NetworkConfig {
     /// the member row and editable from the member context menu.
     #[serde(default)]
     pub nick_notes: std::collections::BTreeMap<String, String>,
+    /// Per-channel autocomplete language (ISO-639-1, e.g. "en" / "es"),
+    /// keyed by lowercased channel name. Set with `/lang <code>`.
+    #[serde(default)]
+    pub channel_langs: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub autoconnect: bool,
 }
@@ -134,6 +138,10 @@ impl std::hash::Hash for NetworkConfig {
         self.channels.hash(state);
         self.buddies.hash(state);
         for (k, v) in &self.nick_notes {
+            k.hash(state);
+            v.hash(state);
+        }
+        for (k, v) in &self.channel_langs {
             k.hash(state);
             v.hash(state);
         }
@@ -218,6 +226,7 @@ impl LegacyAppConfig {
             channels: self.channels,
             buddies: Vec::new(),
             nick_notes: std::collections::BTreeMap::new(),
+            channel_langs: std::collections::BTreeMap::new(),
             autoconnect: true,
         };
         AppConfig {

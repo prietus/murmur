@@ -127,6 +127,7 @@ const PALETTE_COMMANDS: &[(&str, &str, bool)] = &[
     ("/setname", "change your realname mid-session (IRCv3 setname): /setname <new realname>", true),
     ("/monitor", "buddy presence: /monitor add <nick>, /monitor del <nick>, /monitor list", false),
     ("/unfurl", "toggle OpenGraph link previews for this channel: /unfurl on|off|toggle", false),
+    ("/lang", "set autocomplete language for this channel: /lang en|es|none (no arg = show)", false),
     ("/msgid", "debug: show msgid of last message — or /msgid <substring> to grep recent ones", false),
     ("/caps", "debug: list IRCv3 capabilities ACKed by the server", false),
 ];
@@ -696,13 +697,11 @@ struct App {
     /// badge. Cached so we only do the FFI hop when the number actually
     /// changes.
     last_badge_total: u32,
-    /// Lowercased dictionary words (hunspell `.dic` files) loaded from
-    /// `<config_dir>/dicts/` at startup. Drives the ghost-text fallback
-    /// when no nick / command / buffer word matches the typed prefix.
-    dict_words: std::collections::BTreeSet<String>,
-    /// Lowercased words seen in recent channel messages → frequency.
-    /// Drives the ghost-text fallback for jargon, proper nouns, etc.
-    buffer_words: HashMap<String, u32>,
+    /// Lowercased dictionary words (hunspell `.dic` files) grouped by
+    /// ISO-639-1 language code (e.g. "en", "es"). Channels opt in to a
+    /// language via `/lang <code>`; only that bucket is consulted for
+    /// ghost-text completion.
+    dict_words: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
 }
 
 #[derive(Default)]
@@ -1036,7 +1035,6 @@ impl Default for App {
             global_search: None,
             last_badge_total: 0,
             dict_words: load_dict_words(),
-            buffer_words: HashMap::new(),
         };
 
         match config::load() {
@@ -2074,6 +2072,7 @@ impl App {
                     channels: Vec::new(),
                     buddies: Vec::new(),
                     nick_notes: std::collections::BTreeMap::new(),
+                    channel_langs: std::collections::BTreeMap::new(),
                     autoconnect: true,
                 });
                 self.settings_net_idx = self.settings_draft.networks.len() - 1;
@@ -2991,37 +2990,13 @@ impl App {
         true
     }
 
-    fn record_buffer_words(&mut self, body: &str) {
-        for w in tokenize_words(body) {
-            if w.len() < 4 || w.len() > 32 {
-                continue;
-            }
-            *self.buffer_words.entry(w).or_insert(0) += 1;
-        }
-        if self.buffer_words.len() > 4096 {
-            let mut entries: Vec<(String, u32)> = self.buffer_words.drain().collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
-            entries.truncate(2048);
-            self.buffer_words = entries.into_iter().collect();
-        }
-    }
-
-    fn buffer_word_completion(&self, prefix: &str) -> Option<String> {
-        if prefix.len() < 2 {
-            return None;
-        }
-        let lower = prefix.to_lowercase();
-        let mut best: Option<(&String, u32)> = None;
-        for (w, freq) in &self.buffer_words {
-            if !w.starts_with(&lower) || w.len() <= lower.len() {
-                continue;
-            }
-            match best {
-                Some((_, bf)) if bf >= *freq => {}
-                _ => best = Some((w, *freq)),
-            }
-        }
-        best.map(|(w, _)| w[lower.len()..].to_string())
+    /// Active channel's configured language (e.g. "en", "es") if any.
+    /// Returns None for the &status pseudo-channel or unconfigured channels.
+    fn active_channel_lang(&self) -> Option<&str> {
+        let ch = self.channels.get(self.selected)?;
+        let net = self.net(ch.network_id)?;
+        let key = ch.name.to_ascii_lowercase();
+        net.cfg.channel_langs.get(&key).map(|s| s.as_str())
     }
 
     fn ghost_suggestion(&self) -> Option<String> {
@@ -3063,22 +3038,18 @@ impl App {
                 return Some(m[stripped.len()..].to_string());
             }
         }
-        // Word-level fallback only for plain prefixes (no @-prefix, real
-        // letters, ≥ 2 chars). Buffer beats dict because it reflects what
-        // the user is actually seeing right now.
+        // Dict fallback only when the channel has a configured language
+        // and the prefix looks like a real word (plain, alphabetic, ≥ 2 chars).
         if stripped_offset != 0 || stripped.len() < 2 {
             return None;
         }
         if !stripped.chars().all(|c| c.is_alphabetic()) {
             return None;
         }
-        if let Some(rest) = self.buffer_word_completion(stripped) {
-            return Some(rest);
-        }
-        if let Some(w) = dict::find_completion(&self.dict_words, stripped) {
-            return Some(w[p.len()..].to_string());
-        }
-        None
+        let lang = self.active_channel_lang()?;
+        let bucket = self.dict_words.get(lang)?;
+        let w = dict::find_completion(bucket, stripped)?;
+        Some(w[p.len()..].to_string())
     }
 
     fn try_tab_complete(&mut self) -> bool {
@@ -3233,6 +3204,7 @@ impl App {
             "setname" => self.cmd_setname(rest, now),
             "monitor" | "buddy" => self.cmd_monitor(rest, now),
             "unfurl" => self.cmd_unfurl(rest, now),
+            "lang" => self.cmd_lang(rest, now),
             "msgid" => self.cmd_msgid(rest, now),
             "caps" => self.cmd_caps(now),
             other => {
@@ -3265,6 +3237,66 @@ impl App {
             "link unfurl off — URLs in this channel render plain"
         };
         ch.messages.push(system_line(msg, now));
+    }
+
+    fn cmd_lang(&mut self, rest: &str, now: Instant) {
+        let arg = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let ch_idx = self.selected;
+        let (network_id, ch_key) = {
+            let ch = &self.channels[ch_idx];
+            (ch.network_id, ch.name.to_ascii_lowercase())
+        };
+        let mut available: Vec<String> = self.dict_words.keys().cloned().collect();
+        available.sort();
+        let avail_str = if available.is_empty() {
+            "(none installed)".to_string()
+        } else {
+            available.join(", ")
+        };
+
+        if arg.is_empty() {
+            let current = self
+                .net(network_id)
+                .and_then(|n| n.cfg.channel_langs.get(&ch_key).cloned());
+            let body = match current {
+                Some(c) => format!("lang: {c} — available: {avail_str}"),
+                None => format!("lang: not set — available: {avail_str}"),
+            };
+            self.channels[ch_idx].messages.push(system_line(&body, now));
+            return;
+        }
+
+        let clear = matches!(arg.as_str(), "none" | "off" | "clear" | "-");
+        if !clear && !self.dict_words.contains_key(&arg) {
+            self.channels[ch_idx].messages.push(system_line(
+                &format!("no dictionary for '{arg}' — available: {avail_str}"),
+                now,
+            ));
+            return;
+        }
+
+        let Some(net) = self.net_mut(network_id) else {
+            self.channels[ch_idx]
+                .messages
+                .push(system_line("can't set lang outside a network", now));
+            return;
+        };
+        if clear {
+            net.cfg.channel_langs.remove(&ch_key);
+        } else {
+            net.cfg.channel_langs.insert(ch_key, arg.clone());
+        }
+
+        let body = if clear {
+            "autocomplete language cleared".to_string()
+        } else {
+            format!("autocomplete language: {arg}")
+        };
+        let msg = match self.persist_config() {
+            Ok(()) => body,
+            Err(e) => format!("{body} (persist failed: {e})"),
+        };
+        self.channels[ch_idx].messages.push(system_line(&msg, now));
     }
 
     fn cmd_dimm(&mut self, rest: &str, now: Instant) {
@@ -4575,7 +4607,6 @@ impl App {
                     );
                     fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
-                self.record_buffer_words(&body);
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
@@ -4642,7 +4673,6 @@ impl App {
                     );
                     fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
-                self.record_buffer_words(&body);
                 self.channels[idx].messages.push(chat_line_from_meta(
                     nick,
                     body,
@@ -4668,23 +4698,31 @@ impl App {
                     if ch.network_id != network_id {
                         continue;
                     }
-                    if let Some(pos) = ch.members.iter().position(|n| n == &old) {
+                    let Some(pos) = ch.members.iter().position(|n| n == &old) else {
+                        continue;
+                    };
+                    let new_already_present =
+                        ch.members.iter().enumerate().any(|(i, n)| i != pos && n == &new);
+                    if new_already_present {
+                        ch.members.remove(pos);
+                        ch.member_meta.remove(&old);
+                    } else {
                         ch.members[pos] = new.clone();
                         if let Some(meta) = ch.member_meta.remove(&old) {
                             ch.member_meta.insert(new.clone(), meta);
                         }
-                        let (body, nicks) = if is_self {
-                            (format!("you are now {new}"), vec![new.clone()])
-                        } else {
-                            (
-                                format!("{old} is now {new}"),
-                                vec![old.clone(), new.clone()],
-                            )
-                        };
-                        let mut m = joinpart_line(&body, now, None);
-                        m.mask_nicks = nicks;
-                        ch.messages.push(m);
                     }
+                    let (body, nicks) = if is_self {
+                        (format!("you are now {new}"), vec![new.clone()])
+                    } else {
+                        (
+                            format!("{old} is now {new}"),
+                            vec![old.clone(), new.clone()],
+                        )
+                    };
+                    let mut m = joinpart_line(&body, now, None);
+                    m.mask_nicks = nicks;
+                    ch.messages.push(m);
                 }
                 if is_self {
                     self.push_status_in(
@@ -4862,6 +4900,36 @@ impl App {
                             now,
                             Some(nick.clone()),
                         ));
+                }
+                Task::none()
+            }
+            IrcEvent::UserQuit { nick, reason, meta } => {
+                let suffix = reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                for ch in self.channels.iter_mut() {
+                    if ch.network_id != network_id {
+                        continue;
+                    }
+                    let was_member = ch.members.iter().any(|n| n == &nick);
+                    if !was_member {
+                        continue;
+                    }
+                    ch.members.retain(|n| n != &nick);
+                    ch.member_meta.remove(&nick);
+                    if meta.batch.is_none() {
+                        chatlog::append(
+                            &net_name,
+                            &ch.name,
+                            &format!("{}  -- {} quit{}", chatlog::iso_now(), nick, suffix),
+                        );
+                        ch.messages.push(joinpart_line(
+                            &format!("← {nick} quit{suffix}"),
+                            now,
+                            Some(nick.clone()),
+                        ));
+                    }
                 }
                 Task::none()
             }
@@ -9135,30 +9203,19 @@ fn media_error<'a>(url: &str, msg: &str, alpha: f32) -> Element<'a, Message> {
     .into()
 }
 
-fn load_dict_words() -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
+fn load_dict_words() -> std::collections::HashMap<String, std::collections::BTreeSet<String>> {
+    let mut out = std::collections::HashMap::new();
     if let Some(dir) = directories::ProjectDirs::from("", "", "murmur") {
         let user = dir.config_dir().join("dicts");
-        out.extend(dict::load_dir(&user));
+        dict::load_dir_into(&user, &mut out);
     }
     #[cfg(target_os = "linux")]
     {
         for sys in ["/usr/share/hunspell", "/usr/share/myspell/dicts"] {
-            out.extend(dict::load_dir(std::path::Path::new(sys)));
+            dict::load_dir_into(std::path::Path::new(sys), &mut out);
         }
     }
     out
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphabetic() || c == '\''
-}
-
-fn tokenize_words(body: &str) -> impl Iterator<Item = String> + '_ {
-    body.split(|c: char| !is_word_char(c))
-        .filter(|w| w.chars().count() >= 4)
-        .filter(|w| !w.chars().all(|c| c.is_ascii()) || w.chars().any(|c| c.is_alphabetic()))
-        .map(|w| w.to_lowercase())
 }
 
 fn last_word_start(s: &str) -> usize {

@@ -238,6 +238,10 @@ pub enum Event {
         meta: MsgMeta,
     },
     UserLeft { channel: String, nick: String, meta: MsgMeta },
+    /// QUIT: a user disconnected from the network. The UI is responsible
+    /// for removing the nick from every channel's member list on this
+    /// network.
+    UserQuit { nick: String, reason: Option<String>, meta: MsgMeta },
     NickChanged { old: String, new: String, meta: MsgMeta },
     Names { channel: String, members: Vec<MemberEntry> },
     Topic { channel: String, topic: String },
@@ -1351,6 +1355,10 @@ fn translate(
             }]
         }
         Command::PART(channel, _) => vec![Event::UserLeft { channel, nick, meta }],
+        Command::QUIT(reason) => {
+            let reason = reason.filter(|s| !s.is_empty());
+            vec![Event::UserQuit { nick, reason, meta }]
+        }
         Command::NICK(new) => vec![Event::NickChanged { old: nick, new, meta }],
         Command::ACCOUNT(account) => {
             // `account-notify`: a remote user's services-login state changed.
