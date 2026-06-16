@@ -100,6 +100,9 @@ pub struct MemberEntry {
 pub struct MsgMeta {
     /// HH:MM extracted from the `time` tag if present (UTC).
     pub server_time_hhmm: Option<String>,
+    /// Full ISO8601 value of the `time` tag, kept verbatim so it can be
+    /// used as a `CHATHISTORY BEFORE timestamp=` anchor.
+    pub server_time_iso: Option<String>,
     /// Unique server-issued message id from the `msgid` tag.
     pub msgid: Option<String>,
     /// Batch reference tag if this message belongs to an open batch.
@@ -150,6 +153,9 @@ pub enum Outgoing {
     /// Fetch the most recent `limit` messages for `target`. Sent as
     /// `CHATHISTORY LATEST <target> * <limit>`.
     ChatHistoryLatest { target: String, limit: u32 },
+    /// `CHATHISTORY BEFORE <target> timestamp=<ts> <limit>` — fetch
+    /// messages older than the given anchor (scroll-up backfill).
+    ChatHistoryBefore { target: String, before_ts: String, limit: u32 },
     /// `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>` — list
     /// targets with activity in the given window.
     ChatHistoryTargets { from_ts: String, to_ts: String, limit: u32 },
@@ -242,6 +248,9 @@ pub enum Event {
     /// for removing the nick from every channel's member list on this
     /// network.
     UserQuit { nick: String, reason: Option<String>, meta: MsgMeta },
+    /// A `chathistory` batch closed. `target` is the channel/nick the
+    /// batch was for; lets the UI clear its history-loading state.
+    ChatHistoryBatchEnd { target: String },
     NickChanged { old: String, new: String, meta: MsgMeta },
     Names { channel: String, members: Vec<MemberEntry> },
     Topic { channel: String, topic: String },
@@ -499,7 +508,15 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                         );
                                     } else if let Some(id) = tag_with_sign.strip_prefix('-') {
                                         if let Some(info) = batches.remove(id) {
-                                            if let Some(ev) = finalize_multiline(&info) {
+                                            if info.kind == "chathistory" {
+                                                if let Some(target) = info.params.first() {
+                                                    let _ = out
+                                                        .send(Event::ChatHistoryBatchEnd {
+                                                            target: target.clone(),
+                                                        })
+                                                        .await;
+                                                }
+                                            } else if let Some(ev) = finalize_multiline(&info) {
                                                 if out.send(ev).await.is_err() {
                                                     return;
                                                 }
@@ -577,6 +594,17 @@ pub fn subscribe(cfg: &NetworkConfig) -> impl Stream<Item = Event> + Send + 'sta
                                             "LATEST".into(),
                                             target,
                                             "*".into(),
+                                            limit.to_string(),
+                                        ],
+                                    ));
+                                }
+                                Some(Outgoing::ChatHistoryBefore { target, before_ts, limit }) => {
+                                    let _ = sender.send(Command::Raw(
+                                        "CHATHISTORY".into(),
+                                        vec![
+                                            "BEFORE".into(),
+                                            target,
+                                            format!("timestamp={before_ts}"),
                                             limit.to_string(),
                                         ],
                                     ));
@@ -1159,6 +1187,7 @@ fn extract_meta(
             "time" => {
                 if let Some(val) = v.as_deref() {
                     m.server_time_hhmm = parse_iso_hhmm(val);
+                    m.server_time_iso = Some(val.to_string());
                 }
             }
             // Standard IRCv3 `msgid`. `draft/msgid` is the pre-stabilisation

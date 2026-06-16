@@ -6,6 +6,7 @@ mod dict;
 mod emoji;
 mod fts;
 mod irc_worker;
+mod spell;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
@@ -472,6 +473,10 @@ enum Message {
     EmojiPickerQuery(String),
     EmojiPickerCategory(emoji::Category),
     EmojiInsert(&'static str),
+    SpellMenuOpen,
+    SpellMenuClose,
+    SpellApply { start: usize, end: usize, replacement: String },
+    ChatScrolled(scrollable::Viewport),
     MessageContextOpen { channel_idx: usize, msgid: String },
     MessageContextClose,
     MessageContextDelete,
@@ -669,6 +674,9 @@ struct App {
     /// we haven't synced yet). Keyed by `(NetworkId, lower(nick))`.
     presence: HashMap<(NetworkId, String), bool>,
     emoji_picker: Option<EmojiPickerState>,
+    /// Spell-suggestions popover (right-click on the composer). Each
+    /// entry is a misspelled word with its replacement candidates.
+    spell_menu: Option<Vec<SpellMenuEntry>>,
     message_context: Option<MessageContextState>,
     /// Active threaded-reply draft. Cleared on send/cancel/channel-switch.
     reply_draft: Option<ReplyDraft>,
@@ -702,6 +710,9 @@ struct App {
     /// language via `/lang <code>`; only that bucket is consulted for
     /// ghost-text completion.
     dict_words: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    /// Hunspell spell checkers keyed by ISO-639-1 lang code. Only langs
+    /// with a matching `.aff`+`.dic` pair on disk get a checker.
+    spellers: std::collections::HashMap<String, spellbook::Dictionary>,
 }
 
 #[derive(Default)]
@@ -725,6 +736,16 @@ struct ReactTarget {
 struct MessageContextState {
     channel_idx: usize,
     msgid: String,
+}
+
+/// One misspelled word in the spell-suggestions popover.
+struct SpellMenuEntry {
+    /// Byte range of the word in `self.input` at the time the menu
+    /// opened. Replacement is skipped if the input changed since.
+    start: usize,
+    end: usize,
+    word: String,
+    suggestions: Vec<String>,
 }
 
 /// Active reply draft. While `Some`, the next outbound PRIVMSG will
@@ -794,6 +815,15 @@ struct Channel {
     /// Whether we've already asked the server for initial backlog
     /// (CHATHISTORY LATEST). Set on first self-join to avoid refetching.
     chathistory_requested: bool,
+    /// True while a scroll-up `CHATHISTORY BEFORE` fetch is in flight.
+    /// Batch results are prepended instead of appended while set.
+    history_loading: bool,
+    /// Set when a BEFORE fetch came back empty — the server has no
+    /// older history, so stop asking.
+    history_exhausted: bool,
+    /// Insertion cursor for the in-flight BEFORE batch: results arrive
+    /// oldest→newest and slot in at the top, preserving order.
+    history_prepended: usize,
     /// Index of the first unread message in `messages`. The read-marker
     /// separator is drawn just above this message. Set when a message
     /// arrives while the channel is not active+focused; cleared on
@@ -959,6 +989,9 @@ struct ChatMessage {
     mono_secs: u64,
     kind: MsgKind,
     msgid: Option<String>,
+    /// Full ISO8601 `time` tag value; used as the `CHATHISTORY BEFORE`
+    /// anchor when fetching older history on scroll-up.
+    server_time_iso: Option<String>,
     /// Emoji reactions on this message: emoji → set of reactor nicks.
     reactions: HashMap<String, HashSet<String>>,
     /// `+draft/reply=<parent_msgid>` — present when this message is a
@@ -1023,6 +1056,7 @@ impl Default for App {
             read_markers: HashMap::new(),
             presence: HashMap::new(),
             emoji_picker: None,
+            spell_menu: None,
             message_context: None,
             reply_draft: None,
             member_context: None,
@@ -1035,6 +1069,7 @@ impl Default for App {
             global_search: None,
             last_badge_total: 0,
             dict_words: load_dict_words(),
+            spellers: load_spellers(),
         };
 
         match config::load() {
@@ -1189,6 +1224,9 @@ fn status_channel(network_id: NetworkId, topic: &str, messages: Vec<ChatMessage>
         has_mention: false,
         highlight_count: 0,
         chathistory_requested: false,
+        history_loading: false,
+        history_exhausted: false,
+        history_prepended: 0,
         read_marker_idx: None,
         activity: new_activity_buf(),
         last_bucket_at: Instant::now(),
@@ -1338,6 +1376,7 @@ fn system_line(body: &str, now: Instant) -> ChatMessage {
         mono_secs: 0,
         kind: MsgKind::System,
         msgid: None,
+        server_time_iso: None,
         reactions: HashMap::new(),
         reply_to_msgid: None,
         mask_nicks: Vec::new(),
@@ -1360,6 +1399,7 @@ fn joinpart_line(body: &str, now: Instant, nick: Option<String>) -> ChatMessage 
         mono_secs: now.elapsed().as_secs(),
         kind: MsgKind::JoinPart,
         msgid: None,
+        server_time_iso: None,
         reactions: HashMap::new(),
         reply_to_msgid: None,
         mask_nicks: nick.into_iter().collect(),
@@ -1392,6 +1432,7 @@ fn chat_line_from_meta(
         mono_secs: now.elapsed().as_secs(),
         kind,
         msgid: meta.msgid.clone(),
+        server_time_iso: meta.server_time_iso.clone(),
         reactions: HashMap::new(),
         reply_to_msgid: meta.reply_to_msgid.clone(),
         mask_nicks: Vec::new(),
@@ -1682,6 +1723,9 @@ impl App {
             has_mention: false,
             highlight_count: 0,
             chathistory_requested: false,
+            history_loading: false,
+            history_exhausted: false,
+            history_prepended: 0,
             read_marker_idx: None,
             activity: new_activity_buf(),
             last_bucket_at: Instant::now(),
@@ -1810,6 +1854,7 @@ impl App {
                         mono_secs: now.elapsed().as_secs(),
                         kind: MsgKind::Chat,
                         msgid: None,
+                        server_time_iso: None,
                         reactions: HashMap::new(),
                         reply_to_msgid: reply_to,
                         mask_nicks: Vec::new(),
@@ -2268,6 +2313,60 @@ impl App {
                 }
                 iced::widget::operation::focus(COMPOSE_INPUT_ID)
             }
+            Message::ChatScrolled(viewport) => {
+                // With anchor_bottom, the reversed offset measures distance
+                // from the top of the content. Close to zero = user has
+                // scrolled (nearly) all the way up → fetch older history.
+                let near_top = viewport.absolute_offset_reversed().y < 80.0;
+                let scrollable_content =
+                    viewport.content_bounds().height > viewport.bounds().height;
+                if near_top && scrollable_content {
+                    self.maybe_fetch_older_history();
+                }
+                Task::none()
+            }
+            Message::SpellMenuOpen => {
+                self.spell_menu = None;
+                let ranges = self.misspelled_ranges_for_menu();
+                if ranges.is_empty() {
+                    return Task::none();
+                }
+                let Some(dict) = self
+                    .active_channel_lang()
+                    .and_then(|l| self.spellers.get(l))
+                else {
+                    return Task::none();
+                };
+                let entries: Vec<SpellMenuEntry> = ranges
+                    .iter()
+                    .map(|&(start, end)| {
+                        let word = self.input[start..end].to_string();
+                        let mut suggestions = Vec::new();
+                        dict.suggest(&word, &mut suggestions);
+                        suggestions.truncate(5);
+                        SpellMenuEntry { start, end, word, suggestions }
+                    })
+                    .collect();
+                self.spell_menu = Some(entries);
+                Task::none()
+            }
+            Message::SpellMenuClose => {
+                self.spell_menu = None;
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
+            Message::SpellApply { start, end, replacement } => {
+                self.spell_menu = None;
+                // Ranges were captured when the menu opened; only apply if
+                // they still describe a valid slice of the current input.
+                if start <= end
+                    && end <= self.input.len()
+                    && self.input.is_char_boundary(start)
+                    && self.input.is_char_boundary(end)
+                {
+                    self.input.replace_range(start..end, &replacement);
+                }
+                iced::widget::operation::focus(COMPOSE_INPUT_ID)
+            }
             Message::MessageContextOpen { channel_idx, msgid } => {
                 self.message_context = Some(MessageContextState {
                     channel_idx,
@@ -2680,6 +2779,14 @@ impl App {
             return iced::widget::operation::focus(COMPOSE_INPUT_ID);
         }
 
+        // Esc closes the spell-suggestions popover.
+        if self.spell_menu.is_some()
+            && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        {
+            self.spell_menu = None;
+            return iced::widget::operation::focus(COMPOSE_INPUT_ID);
+        }
+
         // Esc closes the per-message action bar.
         if self.message_context.is_some()
             && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
@@ -2997,6 +3104,51 @@ impl App {
         let net = self.net(ch.network_id)?;
         let key = ch.name.to_ascii_lowercase();
         net.cfg.channel_langs.get(&key).map(|s| s.as_str())
+    }
+
+    /// Byte ranges of misspelled words in the compose input, or empty
+    /// when spell checking doesn't apply (no `/lang`, no `.aff` for the
+    /// lang, or a `/command` is being typed).
+    fn misspelled_ranges(&self) -> Vec<(usize, usize)> {
+        if self.input.starts_with('/') {
+            return Vec::new();
+        }
+        let Some(lang) = self.active_channel_lang() else {
+            return Vec::new();
+        };
+        let Some(dict) = self.spellers.get(lang) else {
+            return Vec::new();
+        };
+        let nicks: &[String] = self
+            .channels
+            .get(self.selected)
+            .map(|ch| ch.members.as_slice())
+            .unwrap_or(&[]);
+        spell::misspelled_ranges(dict, &self.input, nicks)
+    }
+
+    /// Like [`Self::misspelled_ranges`] but also checks the trailing
+    /// word: right-clicking is an explicit ask, so the word under the
+    /// cursor is fair game even though the live highlight skips it.
+    fn misspelled_ranges_for_menu(&self) -> Vec<(usize, usize)> {
+        if self.input.starts_with('/') {
+            return Vec::new();
+        }
+        let Some(dict) = self
+            .active_channel_lang()
+            .and_then(|l| self.spellers.get(l))
+        else {
+            return Vec::new();
+        };
+        let nicks: Vec<String> = self
+            .channels
+            .get(self.selected)
+            .map(|ch| ch.members.clone())
+            .unwrap_or_default();
+        // Appending a space makes the tokenizer treat the trailing word
+        // as complete; byte offsets of all tokens are unaffected.
+        let padded = format!("{} ", self.input);
+        spell::misspelled_ranges(dict, &padded, &nicks)
     }
 
     fn ghost_suggestion(&self) -> Option<String> {
@@ -4141,6 +4293,7 @@ impl App {
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Action,
             msgid: None,
+            server_time_iso: None,
             reactions: HashMap::new(),
             reply_to_msgid: None,
             mask_nicks: Vec::new(),
@@ -4177,6 +4330,7 @@ impl App {
             mono_secs: now.elapsed().as_secs(),
             kind: MsgKind::Chat,
             msgid: None,
+            server_time_iso: None,
             reactions: HashMap::new(),
             reply_to_msgid: None,
             mask_nicks: Vec::new(),
@@ -4577,11 +4731,14 @@ impl App {
                     }
                 }
                 let idx = self.ensure_channel_in(network_id, &bucket);
+                let prepending = is_backlog && self.channels[idx].history_loading;
                 // Mark unread/mention even for chathistory backlog: soju
                 // replays missed-while-disconnected messages this way, and
                 // those are still unread from the user's perspective. The
                 // !viewing check keeps the currently-selected channel quiet.
-                if !is_self && !viewing {
+                // Scroll-up backfill (prepending) is older, already-read
+                // history and must not touch unread state.
+                if !is_self && !viewing && !prepending {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
@@ -4607,13 +4764,11 @@ impl App {
                     );
                     fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
-                self.channels[idx].messages.push(chat_line_from_meta(
-                    nick,
-                    body,
-                    MsgKind::Chat,
-                    &meta,
-                    now,
-                ));
+                self.insert_chat_line(
+                    idx,
+                    chat_line_from_meta(nick, body, MsgKind::Chat, &meta, now),
+                    is_backlog,
+                );
                 if !is_backlog {
                     self.channels[idx].bump_activity(now);
                 }
@@ -4647,7 +4802,8 @@ impl App {
                     }
                 }
                 let idx = self.ensure_channel_in(network_id, &bucket);
-                if !is_self && !viewing {
+                let prepending = is_backlog && self.channels[idx].history_loading;
+                if !is_self && !viewing && !prepending {
                     self.channels[idx].has_unread = true;
                     if is_highlight {
                         self.channels[idx].has_mention = true;
@@ -4673,13 +4829,11 @@ impl App {
                     );
                     fts::append(&net_name, &bucket, &nick, &body, &ts);
                 }
-                self.channels[idx].messages.push(chat_line_from_meta(
-                    nick,
-                    body,
-                    MsgKind::Action,
-                    &meta,
-                    now,
-                ));
+                self.insert_chat_line(
+                    idx,
+                    chat_line_from_meta(nick, body, MsgKind::Action, &meta, now),
+                    is_backlog,
+                );
                 if !is_backlog {
                     self.channels[idx].bump_activity(now);
                 }
@@ -4885,9 +5039,17 @@ impl App {
             }
             IrcEvent::UserLeft { channel, nick, meta } => {
                 let idx = self.ensure_channel_in(network_id, &channel);
-                self.channels[idx].members.retain(|n| n != &nick);
-                self.channels[idx].member_meta.remove(&nick);
-                if meta.batch.is_none() {
+                // Defend against bouncer replay/netsplit artifacts: if the
+                // PART is for us, we obviously haven't left (we're rendering
+                // this view). Don't yank ourselves from the member list.
+                let is_self = self
+                    .net(network_id)
+                    .is_some_and(|n| n.cfg.nickname == nick);
+                if !is_self {
+                    self.channels[idx].members.retain(|n| n != &nick);
+                    self.channels[idx].member_meta.remove(&nick);
+                }
+                if !is_self && meta.batch.is_none() {
                     chatlog::append(
                         &net_name,
                         &channel,
@@ -4904,6 +5066,15 @@ impl App {
                 Task::none()
             }
             IrcEvent::UserQuit { nick, reason, meta } => {
+                // Defend against bouncer replay/netsplit artifacts: if the
+                // QUIT is for us, we obviously haven't quit (we're still
+                // rendering events). Drop it silently.
+                let is_self = self
+                    .net(network_id)
+                    .is_some_and(|n| n.cfg.nickname == nick);
+                if is_self {
+                    return Task::none();
+                }
                 let suffix = reason
                     .as_deref()
                     .map(|r| format!(" ({r})"))
@@ -4929,6 +5100,21 @@ impl App {
                             now,
                             Some(nick.clone()),
                         ));
+                    }
+                }
+                Task::none()
+            }
+            IrcEvent::ChatHistoryBatchEnd { target } => {
+                if let Some(ch) = self.channels.iter_mut().find(|c| {
+                    c.network_id == network_id && c.name.eq_ignore_ascii_case(&target)
+                }) {
+                    if ch.history_loading {
+                        ch.history_loading = false;
+                        // Empty BEFORE window → we've reached the start of
+                        // what the server keeps. Don't ask again.
+                        if ch.history_prepended == 0 {
+                            ch.history_exhausted = true;
+                        }
                     }
                 }
                 Task::none()
@@ -5146,6 +5332,66 @@ impl App {
                 limit: 50,
             });
             self.channels[ch_idx].chathistory_requested = true;
+        }
+    }
+
+    /// Scroll-up backfill: ask for messages older than the oldest one we
+    /// hold. No-ops while a fetch is in flight, once the server has said
+    /// there's nothing further back, or when there's no timestamp anchor.
+    fn maybe_fetch_older_history(&mut self) {
+        let Some(ch) = self.channels.get(self.selected) else {
+            return;
+        };
+        if ch.history_loading || ch.history_exhausted {
+            return;
+        }
+        let network_id = ch.network_id;
+        let supported = self
+            .net(network_id)
+            .is_some_and(|n| n.caps_acked.contains("draft/chathistory"));
+        if !supported {
+            return;
+        }
+        let Some(before_ts) = ch
+            .messages
+            .iter()
+            .find_map(|m| m.server_time_iso.clone())
+        else {
+            return;
+        };
+        let target = ch.name.clone();
+        let ch_idx = self.selected;
+        if let Some(tx) = self.net_mut(network_id).and_then(|n| n.outgoing.as_mut()) {
+            let _ = tx.try_send(Outgoing::ChatHistoryBefore {
+                target,
+                before_ts,
+                limit: 100,
+            });
+            self.channels[ch_idx].history_loading = true;
+            self.channels[ch_idx].history_prepended = 0;
+        }
+    }
+
+    /// Append a chat/action line — or, while a scroll-up history fetch is
+    /// in flight, prepend it at the top in arrival (= chronological)
+    /// order, skipping msgids we already hold (the anchor message often
+    /// comes back in the BEFORE window).
+    fn insert_chat_line(&mut self, idx: usize, m: ChatMessage, is_backlog: bool) {
+        let ch = &mut self.channels[idx];
+        if is_backlog && ch.history_loading {
+            if let Some(id) = m.msgid.as_deref() {
+                if ch.messages.iter().any(|x| x.msgid.as_deref() == Some(id)) {
+                    return;
+                }
+            }
+            let pos = ch.history_prepended.min(ch.messages.len());
+            ch.messages.insert(pos, m);
+            ch.history_prepended += 1;
+            if let Some(rm) = ch.read_marker_idx.as_mut() {
+                *rm += 1;
+            }
+        } else {
+            ch.messages.push(m);
         }
     }
 
@@ -5398,6 +5644,8 @@ impl App {
             stack![main, self.palette_overlay()].into()
         } else if self.emoji_picker.is_some() {
             stack![main, self.emoji_picker_overlay()].into()
+        } else if self.spell_menu.is_some() {
+            stack![main, self.spell_menu_overlay()].into()
         } else if self.nick_note_editor.is_some() {
             stack![main, self.note_editor_overlay()].into()
         } else if self.global_search.is_some() {
@@ -5836,6 +6084,116 @@ impl App {
             .align_x(iced::alignment::Horizontal::Right)
             .align_y(iced::alignment::Vertical::Bottom)
             .padding(pad(0.0, tok::S4 as f32 + 50.0, 60.0, 0.0));
+
+        stack![backdrop, anchored].into()
+    }
+
+    fn spell_menu_overlay(&self) -> Element<'_, Message> {
+        let entries = self
+            .spell_menu
+            .as_ref()
+            .expect("spell_menu_overlay called when menu closed");
+
+        let mut rows_vec: Vec<Element<Message>> = Vec::with_capacity(entries.len());
+        for e in entries {
+            let mut cells: Vec<Element<Message>> = Vec::new();
+            cells.push(
+                container(
+                    text(&e.word)
+                        .size(sz(12.0))
+                        .font(medium())
+                        .color(Color { r: 0.91, g: 0.45, b: 0.45, a: 1.0 }),
+                )
+                .padding(pad(tok::S1, tok::S2, tok::S1, 0.0))
+                .into(),
+            );
+            if e.suggestions.is_empty() {
+                cells.push(
+                    container(
+                        text("no suggestions").size(sz(12.0)).color(tok::text_faint()),
+                    )
+                    .padding(pad(tok::S1, 0.0, tok::S1, 0.0))
+                    .into(),
+                );
+            }
+            for s in &e.suggestions {
+                cells.push(
+                    mouse_area(
+                        button(text(s.clone()).size(sz(12.0)).color(tok::text()))
+                            .on_press(Message::SpellApply {
+                                start: e.start,
+                                end: e.end,
+                                replacement: s.clone(),
+                            })
+                            .padding(pad(tok::S1, tok::S2, tok::S1, tok::S2))
+                            .style(|_theme, status| button::Style {
+                                background: Some(Background::Color(match status {
+                                    button::Status::Hovered => tok::bg_hover(),
+                                    _ => tok::bg_2(),
+                                })),
+                                text_color: tok::text(),
+                                border: Border {
+                                    radius: 6.0.into(),
+                                    ..Default::default()
+                                },
+                                shadow: Shadow::default(),
+                                ..Default::default()
+                            }),
+                    )
+                    .interaction(iced::mouse::Interaction::Pointer)
+                    .into(),
+                );
+            }
+            rows_vec.push(
+                row(cells)
+                    .spacing(tok::S2)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            );
+        }
+
+        let panel = container(column(rows_vec).spacing(tok::S2))
+            .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
+            .style(|_| container::Style {
+                background: Some(Background::Color(tok::bg_1())),
+                border: Border {
+                    color: tok::border(),
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                shadow: Shadow {
+                    color: Color { a: 0.45, ..Color::BLACK },
+                    offset: iced::Vector::new(0.0, 12.0),
+                    blur_radius: 40.0,
+                },
+                ..Default::default()
+            })
+            .clip(true);
+
+        let backdrop = mouse_area(
+            container(Space::new().width(Fill).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color { a: 0.0, ..Color::BLACK })),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::SpellMenuClose)
+        .on_right_press(Message::SpellMenuClose);
+
+        // Anchor above the compose bar, aligned with the chat pane.
+        let sidebar_w = self.sidebar_anim.interpolate(
+            0.0,
+            self.sidebar_target_width(),
+            self.now,
+        );
+        let anchored = container(panel)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding(pad(0.0, 0.0, 60.0, sidebar_w + tok::S4));
 
         stack![backdrop, anchored].into()
     }
@@ -7017,7 +7375,21 @@ direct/raw file URL.",
             ..Default::default()
         });
 
-        let msgs = self.render_messages(ch);
+        let mut msgs = self.render_messages(ch);
+        if ch.history_loading {
+            msgs.insert(
+                0,
+                container(
+                    text("… loading older messages")
+                        .size(sz(11.0))
+                        .color(tok::text_faint()),
+                )
+                .width(Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .padding(pad(tok::S2, 0.0, tok::S2, 0.0))
+                .into(),
+            );
+        }
 
         let msg_area = scrollable(
             column(msgs)
@@ -7027,7 +7399,8 @@ direct/raw file URL.",
         )
         .height(Fill)
         .width(Fill)
-        .anchor_bottom();
+        .anchor_bottom()
+        .on_scroll(Message::ChatScrolled);
 
         let msg_area: Element<Message> = if self.search.is_some() {
             stack![msg_area, self.search_overlay()].into()
@@ -7049,29 +7422,58 @@ direct/raw file URL.",
             .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
             .style(|_theme, status| input_style_transparent_bg(status));
 
+        // Typed text is rendered transparent (the real glyphs come from
+        // the text_input stacked on top); misspelled words get a red
+        // background tint that shows through behind them.
+        let misspelled = self.misspelled_ranges();
+        let mut spans = Vec::with_capacity(misspelled.len() * 2 + 2);
+        let mut pos = 0;
+        for &(s, e) in &misspelled {
+            if s > pos {
+                spans.push(
+                    iced::widget::span(typed[pos..s].to_string()).color(Color::TRANSPARENT),
+                );
+            }
+            spans.push(
+                iced::widget::span(typed[s..e].to_string())
+                    .color(Color::TRANSPARENT)
+                    .background(Color { r: 0.86, g: 0.27, b: 0.27, a: 0.22 })
+                    .border(Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 3.0.into(),
+                    }),
+            );
+            pos = e;
+        }
+        if pos < typed.len() {
+            spans.push(iced::widget::span(typed[pos..].to_string()).color(Color::TRANSPARENT));
+        }
+        spans.push(iced::widget::span(ghost_str).color(tok::text_faint()));
+
         let underlay = container(
-            iced::widget::rich_text(vec![
-                iced::widget::span(typed).color(Color::TRANSPARENT),
-                iced::widget::span(ghost_str).color(tok::text_faint()),
-            ])
-            .size(sz(13.0))
-            .font(regular())
-            .on_link_click(Message::OpenUrl),
+            iced::widget::rich_text(spans)
+                .size(sz(13.0))
+                .font(regular())
+                .on_link_click(Message::OpenUrl),
         )
         .padding(pad(tok::S3, tok::S4, tok::S3, tok::S4))
         .width(Fill);
 
-        let text_field: Element<Message> = container(stack![underlay, text_field_raw])
-            .style(|_| container::Style {
-                background: Some(Background::Color(tok::bg_2())),
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            })
-            .into();
+        let text_field: Element<Message> = mouse_area(
+            container(stack![underlay, text_field_raw])
+                .style(|_| container::Style {
+                    background: Some(Background::Color(tok::bg_2())),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                }),
+        )
+        .on_right_press(Message::SpellMenuOpen)
+        .into();
 
         let send_btn = button(
             container(text("↑").size(sz(16.0)).font(medium()).color(if has_text {
@@ -9213,6 +9615,21 @@ fn load_dict_words() -> std::collections::HashMap<String, std::collections::BTre
     {
         for sys in ["/usr/share/hunspell", "/usr/share/myspell/dicts"] {
             dict::load_dir_into(std::path::Path::new(sys), &mut out);
+        }
+    }
+    out
+}
+
+fn load_spellers() -> std::collections::HashMap<String, spellbook::Dictionary> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(dir) = directories::ProjectDirs::from("", "", "murmur") {
+        let user = dir.config_dir().join("dicts");
+        spell::load_dir_into(&user, &mut out);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for sys in ["/usr/share/hunspell", "/usr/share/myspell/dicts"] {
+            spell::load_dir_into(std::path::Path::new(sys), &mut out);
         }
     }
     out
