@@ -167,14 +167,31 @@ fn main() -> iced::Result {
         }
     }
 
-    iced::application(App::default, App::update, App::view)
+    let app = iced::application(App::default, App::update, App::view)
         .title("Murmur")
         .theme(App::theme)
         .subscription(App::subscription)
         .default_font(Font::with_name(user_font_name()))
         .font(FONT_REGULAR)
-        .font(FONT_MEDIUM)
-        .run()
+        .font(FONT_MEDIUM);
+
+    // On Linux, the window icon comes from the installed `.desktop` file:
+    // GNOME/Wayland matches a window to its desktop entry (and thus its
+    // `Icon=`) by the `app_id` / X11 `WM_CLASS`. Without this it defaults
+    // to an empty string, so the shell can't find `murmur.desktop` and
+    // shows the generic missing-icon placeholder. Must match the desktop
+    // file basename (`murmur.desktop`). macOS gets its icon from the
+    // `.app` bundle instead, and its `PlatformSpecific` has no such field.
+    #[cfg(target_os = "linux")]
+    let app = app.window(iced::window::Settings {
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: "murmur".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    app.run()
 }
 
 mod tok {
