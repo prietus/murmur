@@ -8134,13 +8134,17 @@ direct/raw file URL.",
         };
 
         let hl_bg = Color { a: 0.55 * alpha, ..tok::accent() };
-        // Highlight nicks baked into the body — `nick:` addressing, mid-
-        // sentence mentions — in their nick palette colour so you can spot
-        // who's being talked to at a glance. Skipped in privacy mode (the
-        // body already had nicks rewritten to masks) and on system lines
-        // (their nick chrome is handled by `mask_nicks` upstream).
-        let highlight_nicks =
-            !self.privacy_mode && m.kind != MsgKind::System && !channel_members.is_empty();
+        // Highlight only the user's *own* nick baked into the body, so they
+        // can spot when they're being addressed. Other members' nicks are
+        // left as plain text: colouring every mentioned nick the same way as
+        // the author's nick label made it hard to tell who was actually
+        // speaking (`Earnestly onexused: …` lit up both). Skipped in privacy
+        // mode (the body already had nicks rewritten to masks) and on system
+        // lines (their nick chrome is handled by `mask_nicks` upstream).
+        let highlight_nicks = !self.privacy_mode
+            && m.kind != MsgKind::System
+            && !my_nick.is_empty()
+            && !channel_members.is_empty();
         for seg in body_segments(body_ref) {
             match seg {
                 BodySeg::Text(t) => {
@@ -8151,11 +8155,11 @@ direct/raw file URL.",
                     };
                     for (sub, nick_match) in nick_parts {
                         let (chunk_color, chunk_font) = match nick_match {
-                            Some(nick) => {
+                            Some(nick) if nick.eq_ignore_ascii_case(my_nick) => {
                                 let nc = nick_color(nick);
                                 (Color { a: alpha, ..nc }, medium())
                             }
-                            None => (text_color, body_font),
+                            _ => (text_color, body_font),
                         };
                         let parts = match search_q {
                             Some(q) => split_on_query(sub, q),
